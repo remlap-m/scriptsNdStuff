@@ -10,7 +10,8 @@ let Skew           = 30m;
 let Liveness       = 35m;                      // rule frequency + buffer
 let Threshold      = 200;
 let DistinctRatio  = 0.75;
-let ConcentrationHint = 50.0;
+let MaxRoots       = 2;                        // PRIMARY NOISE GATE - see notes
+let ConcentrationHint = 50.0;                  // files-per-folder = staging-like
 let ExcludedAccounts  = dynamic([]);
 let ExcludedProcesses = dynamic(["REMOVED.exe"]);
 let ExcludedFolders   = dynamic([
@@ -63,6 +64,16 @@ DeviceFileEvents
 | extend DirPath = iff(FolderPath endswith FileName,
                        tostring(parse_path(FolderPath).DirectoryPath),
                        FolderPath)
+// Destination tree root. Staging converges on one root even when it preserves
+// subfolder structure; sync clients and backup agents scatter across many.
+// VERIFY the slice depths against your own paths - see notes below.
+| extend PathParts = split(DirPath, @"\")
+| extend DestRoot  = case(
+      DirPath startswith @"\\" and array_length(PathParts) > 4,
+          strcat_array(array_slice(PathParts, 0, 4), @"\"),   // \\server\share\top
+      array_length(PathParts) > 3,
+          strcat_array(array_slice(PathParts, 0, 3), @"\"),   // C:\Users\john\Desktop
+      DirPath)
 | extend Off = Offsets
 | mv-expand Off to typeof(long)
 | extend WindowStart = bin(Timestamp - Off * 1m, Bucket) + Off * 1m
@@ -70,6 +81,8 @@ DeviceFileEvents
     FilesCreated    = count(),
     DistinctFiles   = dcount(strcat(DirPath, "|", FileName)),
     DistinctFolders = dcount(DirPath),
+    DistinctRoots   = dcount(DestRoot),
+    RootSample      = make_set(DestRoot, 5),
     TotalBytes      = sum(FileSize),
     NetworkPathHits = countif(FolderPath startswith @"\\"),
     OtherDriveHits  = countif(not(FolderPath startswith "C:\\")
@@ -96,6 +109,8 @@ DeviceFileEvents
   by Actor, DeviceId, WindowStart
 | where FilesCreated  >= Threshold
 | where DistinctFiles >= toint(Threshold * DistinctRatio)
+// --- concentration gate: the main noise reduction ---
+| where DistinctRoots <= MaxRoots
 | where IngestLast > ago(Liveness)
 | summarize arg_max(FilesCreated, *) by Actor, DeviceId
 | extend WindowEnd      = WindowStart + Bucket
@@ -103,13 +118,10 @@ DeviceFileEvents
 | extend FilesPerMin    = round(todouble(FilesCreated) / max_of(todouble(BurstSeconds) / 60.0, 0.5), 1)
 | extend TotalMB        = round(todouble(TotalBytes) / 1048576.0, 1)
 | extend FilesPerFolder = round(todouble(FilesCreated) / todouble(max_of(DistinctFolders, 1)), 1)
-// NOISE CUT - uncomment to alert only on the staging shape (few dest folders,
-// many files) rather than all high-volume writes. Biggest single lever.
-//| where FilesPerFolder >= ConcentrationHint or NetworkPathHits > 0 or OtherDriveHits > 0
 | extend BurstShape = case(
-      FilesPerFolder >= ConcentrationHint, "Concentrated (staging-like)",
-      DistinctFolders >= 50,               "Dispersed (mass-write / encryption-like)",
-      "Mixed")
+      DistinctFolders <= 3,                "Flat (single-folder staging)",
+      FilesPerFolder >= ConcentrationHint, "Concentrated",
+      "Tree copy (structure preserved)")
 | extend Destination = case(
       OtherDriveHits  > 0, "SecondaryOrRemovableDrive",
       NetworkPathHits > 0, "RemoteShare",
@@ -118,16 +130,30 @@ DeviceFileEvents
       OtherDriveHits > 0 or NetworkPathHits > 0, "High",
       "Medium")
 | project
-    WindowStart, WindowEnd,
+    // triage-first ordering
+    WindowStart,
     Actor,
+    DeviceName,
+    FilesCreated,
+    DistinctRoots,
+    RootSample,
+    BurstShape,
+    Destination,
+    InitiatingProcessFileName,
+    FilesPerFolder,
+    DistinctFolders,
+    DistinctFiles,
+    TotalMB,
+    FilesPerMin,
+    BurstSeconds,
+    AlertSeverity,
+    // supporting detail
+    WindowEnd,
     InitiatingProcessAccountName, InitiatingProcessAccountDomain,
-    DeviceName, DeviceId,
-    FilesCreated, DistinctFiles, DistinctFolders,
-    FilesPerFolder, FilesPerMin, BurstSeconds, TotalMB,
-    BurstShape, Destination, AlertSeverity,
+    DeviceId,
     NetworkPathHits, OtherDriveHits, RemoteSession, InboundSmbHits,
     FirstEvent, LastEvent,
-    InitiatingProcessFileName, InitiatingProcessSHA256, InitiatingProcessFolderPath,
+    InitiatingProcessSHA256, InitiatingProcessFolderPath,
     InitiatingProcessParentFileName, InitiatingProcessCommandLine,
     SampleFile, SampleFolder,
     FileSample, FolderSample, Processes, OriginUrls, Labels
