@@ -152,3 +152,131 @@ DeviceFileEvents
     InitiatingProcessParentFileName, InitiatingProcessCommandLine,
     SampleFile, SampleFolder,
     FileSample, FolderSample, ExtSample, Processes, OriginUrls, Labels
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    HUNT VERSION
+
+
+
+    // =============================================================================
+// HUNTING VERSION - Mass file creation in unusual location
+// Same logic as the detection rule, but:
+//   - Lookback extended to 7 days
+//   - Liveness gate removed (no dedup against previous runs)
+//   - Final arg_max dedup removed (shows every qualifying window)
+//   - TimeGenerated/Skew filter simplified
+// Not suitable for deployment as a scheduled rule.
+// =============================================================================
+
+let StepMin        = 5;
+let BucketMin      = 20;
+let Bucket         = BucketMin * 1m;
+let Offsets        = range(0, BucketMin - StepMin, StepMin);   // 0,5,10,15
+let Lookback       = 7d;
+let Threshold      = 100;
+
+let ExcludedAccounts = dynamic([
+    // "user@domain.com"
+]);
+let ExcludedProcesses = dynamic([
+    // "example.exe"
+]);
+let ExcludedFileNames = dynamic([
+    // "example.txt"
+]);
+let ExcludedFolders = dynamic([
+    // @"\ExampleFolder\"
+]);
+let InterestingExt = dynamic([
+    "doc", "docx", "docm", "dot", "dotx",
+    "xls", "xlsx", "xlsm", "ppt", "pptx",
+    "pdf", "msg", "eml", "rtf", "txt", "csv",
+    "zip", "7z", "rar", "pst", "ost"
+]);
+
+DeviceFileEvents
+| where TimeGenerated > ago(Lookback)
+| where ActionType == "FileCreated"
+| where isnotempty(FileName)
+| where not(FolderPath startswith @"\\")
+| where not(FolderPath matches regex @"(?i)C:\\Users\\[^\\]+\\(Documents|Downloads|Desktop|OneDrive - TENANTNAME)(\\|$)")
+| where InitiatingProcessFileName !in~ (ExcludedProcesses)
+| where FileName !in~ (ExcludedFileNames)
+| where not(FolderPath has_any (ExcludedFolders))
+| where not(FileName startswith "~$")
+| where not(FileName startswith "PowerShell_transcript")
+| where not(InitiatingProcessCommandLine has_any ("/systemstartup", "Quarantine"))
+| extend NameParts = split(FileName, ".")
+| extend Ext       = tolower(tostring(NameParts[array_length(NameParts) - 1]))
+| where array_length(NameParts) > 1
+| where Ext in (InterestingExt)
+| extend Actor = tolower(iff(isnotempty(InitiatingProcessAccountUpn),
+                             InitiatingProcessAccountUpn,
+                             strcat(InitiatingProcessAccountDomain, @"\", InitiatingProcessAccountName)))
+| where isnotempty(Actor) and Actor != @"\"
+| where Actor !endswith "$"
+| where Actor !in~ (ExcludedAccounts)
+| extend DirPath = iff(FolderPath endswith FileName,
+                       tostring(parse_path(FolderPath).DirectoryPath),
+                       FolderPath)
+| extend Off = Offsets
+| mv-expand Off to typeof(long)
+| extend WindowStart = bin(Timestamp - Off * 1m, Bucket) + Off * 1m
+| summarize
+    FilesCreated    = count(),
+    DistinctFiles   = dcount(strcat(DirPath, "|", FileName)),
+    DistinctFolders = dcount(DirPath),
+    DistinctExt     = dcount(Ext),
+    TotalBytes      = sum(FileSize),
+    OtherDriveHits  = countif(not(FolderPath startswith "C:\\")
+                              and not(FolderPath startswith @"\\")),
+    RemoteSession   = countif(IsInitiatingProcessRemoteSession == true),
+    FileSample      = make_set(FileName, 10),
+    FolderSample    = make_set(DirPath, 10),
+    ExtSample       = make_set(Ext, 10),
+    Processes       = make_set(InitiatingProcessFileName, 5),
+    OriginUrls      = make_set(FileOriginUrl, 5),
+    Labels          = make_set(SensitivityLabel, 5),
+    FirstEvent      = min(Timestamp),
+    LastEvent       = max(Timestamp),
+    take_any(DeviceName,
+             InitiatingProcessFileName,
+             InitiatingProcessFolderPath,
+             InitiatingProcessCommandLine)
+  by Actor, DeviceId, WindowStart
+| where FilesCreated >= Threshold
+| extend WindowEnd      = WindowStart + Bucket
+| extend BurstSeconds   = datetime_diff('second', LastEvent, FirstEvent)
+| extend FilesPerMin    = round(todouble(FilesCreated) / max_of(todouble(BurstSeconds) / 60.0, 0.5), 1)
+| extend TotalMB        = round(todouble(TotalBytes) / 1048576.0, 1)
+| extend FilesPerFolder = round(todouble(FilesCreated) / todouble(max_of(DistinctFolders, 1)), 1)
+| project
+    WindowStart, WindowEnd,
+    Actor, DeviceName,
+    FilesCreated, DistinctFolders, DistinctExt, FilesPerFolder,
+    InitiatingProcessFileName,
+    FolderSample, ExtSample, Processes,
+    DistinctFiles, TotalMB, FilesPerMin, BurstSeconds,
+    OtherDriveHits, RemoteSession,
+    FirstEvent, LastEvent,
+    FileSample, OriginUrls, Labels,
+    InitiatingProcessFolderPath, InitiatingProcessCommandLine,
+    DeviceId
+| order by FilesCreated desc
