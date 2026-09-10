@@ -66,6 +66,7 @@ DeviceFileEvents
 | where isnotempty(FileName)
 // --- primary location filter: exclude UNC/network share paths ----------------
 | where not(FolderPath startswith @"\\")
+| where not(FolderPath matches regex @"(?i)C:\\Users\\[^\\]+\\(Documents|Downloads|Desktop|OneDrive - ACE CLOUD TECHNOLOGIES)(\\|$)")
 // --- cheap filters first -----------------------------------------------------
 | where InitiatingProcessFileName !in~ (ExcludedProcesses)
 | where FileName !in~ (ExcludedFileNames)
