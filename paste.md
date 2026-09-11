@@ -554,6 +554,19 @@ Correlated
 
 
 
+
+
+DeviceFileEvents
+| where TimeGenerated > ago(7d)
+| where ActionType == "FileCreated"
+| where FolderPath has @"\appdata\local\temp\"
+| where FolderPath has_any ("onedrive","outlook")
+| project FolderPath, FileName, InitiatingProcessFileName
+| take 30
+
+
+
+
 ***********
 
 
