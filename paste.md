@@ -233,4 +233,127 @@ DeviceFileEvents
             DistinctFiles = dcount(strcat(DeviceId, "|", FolderPath))
 | extend EventsPerFile = round(Events * 1.0 / DistinctFiles, 1)
 
-            
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+            //=====================================================================
+// VIABILITY TEST — staging followed by archiving
+// Backtest only. NOT an analytics rule. No exclusions applied.
+// Returns 3 numbers: DedupedAlerts / Devices / Accounts
+//=====================================================================
+
+let Lookback             = 7d;
+let StagingWindow        = 30m;
+let StagingFileThreshold = 100;
+let ArchiveMinSizeBytes  = 0;
+
+let DocExtensions = dynamic([
+    "doc","docx","docm","dot","dotx","xls","xlsx","xlsm","xlsb",
+    "ppt","pptx","pptm","pdf","csv","txt","rtf","odt","ods","odp",
+    "msg","eml","one","vsd","vsdx"
+]);
+let ArchiveExtensions = dynamic([
+    "zip","zipx","7z","rar","tar","gz","tgz","bz2","xz","cab","iso","arj","lzh"
+]);
+let ArchiverProcesses = dynamic([
+    "7z.exe","7zg.exe","7zfm.exe","7za.exe","winrar.exe","rar.exe",
+    "peazip.exe","bandizip.exe","wzzip.exe","winzip32.exe","winzip64.exe",
+    "tar.exe","zip.exe","makecab.exe","explorer.exe",
+    "powershell.exe","pwsh.exe","cmd.exe","python.exe","wscript.exe","cscript.exe"
+]);
+let DecompressionProcesses = dynamic([
+    "7z.exe","7zg.exe","7zfm.exe","7za.exe","winrar.exe","rar.exe","unrar.exe",
+    "tar.exe","peazip.exe","bandizip.exe","wzzip.exe","winzip32.exe","winzip64.exe",
+    "zip.exe","unzip.exe"
+]);
+// ---- Exclusions: populate later, leave empty for baseline ----
+let ExcludedInitiatingProcesses = dynamic([]);
+let ExcludedFolderPathFragments = dynamic([]);
+let ExcludedAccountSids         = dynamic([]);
+let ExcludedDeviceNames         = dynamic([]);
+
+let ArchiveAnchors =
+    DeviceFileEvents
+    | where TimeGenerated between (ago(Lookback) .. now())
+    | where ActionType == "FileCreated"
+    | extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
+    | where Ext in (ArchiveExtensions)
+    | where tolower(InitiatingProcessFileName) in (ArchiverProcesses)
+    | extend AccountSid = tostring(InitiatingProcessAccountSid)
+    | where isnotempty(DeviceId) and isnotempty(AccountSid)
+    | where AccountSid !in (ExcludedAccountSids)
+    | where DeviceName !in~ (ExcludedDeviceNames)
+    | where ArchiveMinSizeBytes == 0 or tolong(FileSize) >= ArchiveMinSizeBytes
+    | project ArchiveTime = TimeGenerated, DeviceId, DeviceName, AccountSid,
+              AccountUpn     = InitiatingProcessAccountUpn,
+              ArchiveName    = FileName,
+              ArchiveProcess = InitiatingProcessFileName;
+
+let ArchiveKeyed =
+    ArchiveAnchors
+    | mv-expand JoinBucket = pack_array(
+          bin(ArchiveTime, StagingWindow),
+          bin(ArchiveTime, StagingWindow) - StagingWindow
+      ) to typeof(datetime);
+
+let StagingEvents =
+    DeviceFileEvents
+    | where TimeGenerated between (ago(Lookback) .. now())
+    | where ActionType == "FileCreated"
+    | extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
+    | where Ext in (DocExtensions)
+    | extend AccountSid = tostring(InitiatingProcessAccountSid),
+             InitProc   = tolower(InitiatingProcessFileName)
+    | where isnotempty(DeviceId) and isnotempty(AccountSid)
+    | where InitProc !in (DecompressionProcesses)
+    | where InitProc !in (ExcludedInitiatingProcesses)
+    | where array_length(ExcludedFolderPathFragments) == 0
+         or not(tolower(FolderPath) has_any (ExcludedFolderPathFragments))
+    | project StageTime  = TimeGenerated,
+              DeviceId, AccountSid,
+              StagePath  = FolderPath,
+              JoinBucket = bin(TimeGenerated, StagingWindow);
+
+let Correlated =
+    ArchiveKeyed
+    | join kind=inner hint.shufflekey=DeviceId (StagingEvents)
+        on DeviceId, AccountSid, JoinBucket
+    | where StageTime < ArchiveTime
+    | where StageTime >= ArchiveTime - StagingWindow
+    | summarize StagedFileCount = count_distinct(StagePath)
+        by ArchiveTime, DeviceId, DeviceName, AccountSid, AccountUpn,
+           ArchiveName, ArchiveProcess;
+
+Correlated
+| where StagedFileCount >= StagingFileThreshold
+| summarize MaxStaged = max(StagedFileCount)
+    by DeviceId, DeviceName, AccountSid, AccountUpn,
+       RunWindow = bin(ArchiveTime, 30m)
+| summarize DedupedAlerts = count(),
+            Devices       = dcount(DeviceId),
+            Accounts      = dcount(AccountSid)
