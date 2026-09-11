@@ -143,11 +143,8 @@ Correlated
 DeviceFileEvents
 | where TimeGenerated > ago(1h)
 | where ActionType == "FileCreated"
-| where isnotempty(FileName) and isnotempty(FolderPath)
-| extend FolderEndsWithFileName = tolower(FolderPath) endswith tolower(FileName)
-| summarize Events = count() by FolderEndsWithFileName, ActionType
-| order by Events desc
-
+| project TimeGenerated, ActionType, FileName, FolderPath
+| take 20
 
 
 
