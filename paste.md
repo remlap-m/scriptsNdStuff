@@ -200,4 +200,21 @@ Correlated
 
 
 
+
+
+DeviceFileEvents
+| where TimeGenerated > ago(7d)
+| where ActionType in ("FileCreated","FileRenamed")
+| extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
+| where Ext in ("zip","7z","rar","zipx")
+| extend SizeBucket = case(
+      isempty(FileSize), "null",
+      tolong(FileSize) == 0, "zero",
+      tolong(FileSize) < 1048576, "under 1MB",
+      tolong(FileSize) < 52428800, "1-50MB",
+      tolong(FileSize) < 262144000, "50-250MB",
+      "250MB+")
+| summarize Events = count() by SizeBucket, ActionType
+| order by Events desc
+
             
