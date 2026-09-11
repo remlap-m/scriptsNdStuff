@@ -158,4 +158,23 @@ Correlated
           ArchiveInStagingTree, ArchiveProcessCmdLine
 | order by ArchiveTime desc
 
+
+
+let Deduped = Correlated
+    | where StagedFileCount >= 100
+    | summarize ArchivesInWindow = count(),
+                MaxStaged        = max(StagedFileCount),
+                TopArchiveProc   = tolower(any(ArchiveProcess))
+        by DeviceId, DeviceName, AccountSid, AccountUpn,
+           RunWindow = bin(ArchiveTime, 30m);
+Deduped
+| summarize Alerts       = count(),
+            Devices      = dcount(DeviceId),
+            Accounts     = dcount(AccountSid),
+            MaxStaged    = max(MaxStaged),
+            SampleDevice = any(DeviceName),
+            SampleUser   = any(AccountUpn)
+    by ArchiveProcess = TopArchiveProc
+| order by Alerts desc
+| extend RunningTotal = row_cumsum(Alerts)
             
