@@ -357,3 +357,20 @@ Correlated
 | summarize DedupedAlerts = count(),
             Devices       = dcount(DeviceId),
             Accounts      = dcount(AccountSid)
+
+
+
+
+
+
+
+
+Correlated
+| where StagedFileCount >= StagingFileThreshold
+| summarize MaxStaged = max(StagedFileCount)
+    by DeviceId, DeviceName, AccountSid, AccountUpn,
+       ArchiveProcess = tolower(ArchiveProcess),
+       RunWindow = bin(ArchiveTime, 30m)
+| summarize Alerts = count(), Devices = dcount(DeviceId), Accounts = dcount(AccountSid)
+    by ArchiveProcess
+| order by Alerts desc
