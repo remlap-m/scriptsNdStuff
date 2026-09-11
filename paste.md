@@ -1,27 +1,15 @@
 //=====================================================================
-// Document Staging and Archiving in Unusual Locations
-// MITRE: TA0009 Collection — T1074.001, T1560.001
-//
-// Fires on EITHER of two independent branches:
-//   A. Documents staged in unusual locations, then archived anywhere
-//   B. Documents staged anywhere, then archived to an unusual location
-// MatchReason records which branch fired ("Both" = strongest signal).
-//
-// Rule config: queryFrequency 30m | queryPeriod 3h
-// Requires: Defender XDR connector with DeviceFileEvents streaming.
-//
-// SCOPE LIMITATION: only C: volume activity. Non-C: paths (mapped
-// drives, network shares) are out of scope by design.
+// HUNT — Document staging and archiving in unusual locations
+// 7-day retrospective. Ordering tolerance replaces strict ordering
+// to accommodate observed MDE timestamp skew on bulk file operations.
 //=====================================================================
 
-// ---------- Tunables (all environment-specific) ----------
-let AnchorSlice          = 30m;        // MUST equal queryFrequency
-let StagingWindow        = 30m;        // staging lookback per archive
-let StagingFileThreshold = 100;        // TUNE
-let ArchiveMinSizeBytes  = 10485760;   // 10 MB — TUNE
+let Lookback             = 7d;
+let StagingWindow        = 30m;
+let OrderTolerance       = 15m;        // staging may report AFTER archive
+let StagingFileThreshold = 100;        // NOTE: unreliable at volume — see caveats
+let ArchiveMinSizeBytes  = 10485760;   // 10 MB
 
-// Normal user document locations. Used on BOTH sides: staging here is
-// "normal location", archiving here is "normal destination".
 let UserDocRegex = @"(?i)C:\\Users\\[^\\]+\\(Documents|Downloads|Desktop|OneDrive - ORG NAME HERE|OneDrive - ORG NAME|ORG NAME)(\\|$)";
 
 let DocExtensions = dynamic([
@@ -45,20 +33,16 @@ let DecompressionProcesses = dynamic([
 ]);
 
 //---------------------------------------------------------------------
-// BLOCK 1 — Archive anchors (the rare event; drives the whole rule).
-// Sliced by ingestion_time() so late-arriving MDE data is processed
-// exactly once, in the run where it lands.
+// BLOCK 1 — Archive anchors
 //---------------------------------------------------------------------
 let ArchiveAnchors =
     DeviceFileEvents
-    | where ingestion_time() > ago(AnchorSlice)
+    | where TimeGenerated between (ago(Lookback) .. now())
     | where ActionType == "FileCreated"
     | extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
     | where Ext in (ArchiveExtensions)
     | where InitiatingProcessFileName in~ (ArchiverProcesses)
     | where ArchiveMinSizeBytes == 0 or tolong(FileSize) >= ArchiveMinSizeBytes
-    // OneDrive "download as zip" — multipart volume unpacked into temp.
-    // Narrow: requires process AND temp path AND volume-suffix directory.
     | where not(InitiatingProcessFileName in~ ("explorer.exe","onedrive.exe")
             and FolderPath has @"\appdata\local\temp\"
             and FolderPath matches regex @"\.zip\.[0-9a-f]{3}\\")
@@ -76,32 +60,29 @@ let ArchiveAnchors =
               ArchiveName      = FileName,
               ArchiveFolderNorm, ArchiveUnusual,
               ArchiveSizeBytes = tolong(FileSize),
-              ArchiveSha256    = SHA256,
               ArchiveProcess   = InitiatingProcessFileName,
+              ArchiveParent    = InitiatingProcessParentFileName,
               ArchiveCmdLine   = InitiatingProcessCommandLine;
 
 //---------------------------------------------------------------------
-// BLOCK 2 — Bucket keys. Bounds the join to 2 bins per anchor,
-// preventing a cross product against all file activity in the period.
+// BLOCK 2 — Bucket keys. Widened to 3 bins to cover the tolerance
+// window, since staging can now fall in the bin AFTER the archive.
 //---------------------------------------------------------------------
 let ArchiveKeyed =
     ArchiveAnchors
     | mv-expand JoinBucket = pack_array(
+          bin(ArchiveTime, StagingWindow) + StagingWindow,
           bin(ArchiveTime, StagingWindow),
           bin(ArchiveTime, StagingWindow) - StagingWindow
       ) to typeof(datetime);
 
 //---------------------------------------------------------------------
-// BLOCK 3 — Staging candidates. Application noise stays as filters;
-// user-document location is a FLAG so branch B can still fire there.
-// Filter order: cheapest and most selective first.
+// BLOCK 3 — Staging candidates
 //---------------------------------------------------------------------
 let StagingEvents =
     DeviceFileEvents
+    | where TimeGenerated between (ago(Lookback) .. now())
     | where ActionType == "FileCreated"
-    // Optional prefilter — cuts extract() cost. Superset match (can
-    // over-match, never under-match); Ext check below is authoritative.
-    // | where FileName has_any (DocExtensions)
     | extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
     | where Ext in (DocExtensions)
     | extend InitProc = tolower(InitiatingProcessFileName)
@@ -144,21 +125,19 @@ let StagingEvents =
               JoinBucket   = bin(TimeGenerated, StagingWindow);
 
 //---------------------------------------------------------------------
-// BLOCK 4 — Correlate. The ordering constraint is what separates
-// staging from decompression; do not remove it.
+// BLOCK 4 — Correlate with ordering TOLERANCE
 //---------------------------------------------------------------------
 let Correlated =
     ArchiveKeyed
     | join kind=inner hint.shufflekey=DeviceId (StagingEvents)
         on DeviceId, AccountSid, JoinBucket
-    | where StageTime < ArchiveTime
+    | where StageTime <  ArchiveTime + OrderTolerance
     | where StageTime >= ArchiveTime - StagingWindow
-    // Split: archive inside staging tree = suspicious.
-    //        staged files under archive path = extraction artefact.
     | extend ArchiveUnderStaging = iff(ArchiveFolderNorm startswith StageFolderNorm, 1, 0),
              StagingUnderArchive = iff(StageFolderNorm startswith ArchiveFolderNorm, 1, 0)
     | summarize StagedFileCount       = count_distinct(StagePath),
                 StagedUnusualCount    = count_distinctif(StagePath, StageUnusual == 1),
+                StagedAfterArchive    = count_distinctif(StagePath, StageTime > ArchiveTime),
                 StagingFolderCount    = count_distinct(StageFolderNorm),
                 StagingFolders        = make_set(StageFolderNorm, 5),
                 StagingUnusualFolders = make_setif(StageFolderNorm, StageUnusual == 1, 5),
@@ -170,15 +149,16 @@ let Correlated =
                 StagingUnderArchive   = max(StagingUnderArchive)
         by ArchiveTime, DeviceId, DeviceName, AccountSid, AccountUpn,
            ArchiveName, ArchiveFolderNorm, ArchiveUnusual, ArchiveSizeBytes,
-           ArchiveSha256, ArchiveProcess, ArchiveCmdLine;
+           ArchiveProcess, ArchiveParent, ArchiveCmdLine;
 
 //---------------------------------------------------------------------
-// BLOCK 5 — Two-branch filter. Exact union of the two original rules.
+// BLOCK 5 — Two branches, plus structural extraction filter
 //---------------------------------------------------------------------
-let Alerts =
+let Hits =
     Correlated
-    // Branch A: enough files staged in UNUSUAL locations (archive anywhere)
-    // Branch B: enough files staged ANYWHERE + archive in unusual location
+    // Structural: staged files UNDER the archive path = extraction.
+    // Doing more work now that ordering is loose.
+    | where StagingUnderArchive == 0
     | where StagedUnusualCount >= StagingFileThreshold
          or (ArchiveUnusual == 1 and StagedFileCount >= StagingFileThreshold)
     | extend MatchReason = case(
@@ -187,60 +167,44 @@ let Alerts =
                                                                               "ArchiveUnusual");
 
 //---------------------------------------------------------------------
-// BLOCK 6 — One row per device + account. arg_max picks the largest
-// archive for File / FileHash entity mapping.
+// BLOCK 6 — One row per device + account + window
 //---------------------------------------------------------------------
-Alerts
+Hits
 | summarize MatchReason           = tostring(make_set(MatchReason)),
             StagedFileCount       = max(StagedFileCount),
             StagedUnusualCount    = max(StagedUnusualCount),
+            StagedAfterArchive    = max(StagedAfterArchive),
             StagingFolderCount    = max(StagingFolderCount),
-            StagingFolders        = take_any(StagingFolders),
-            StagingUnusualFolders = take_any(StagingUnusualFolders),
-            StagingProcesses      = take_any(StagingProcesses),
-            StagingExtensions     = take_any(StagingExtensions),
+            StagingFolders        = tostring(take_any(StagingFolders)),
+            StagingUnusualFolders = tostring(take_any(StagingUnusualFolders)),
+            StagingProcesses      = tostring(take_any(StagingProcesses)),
+            StagingExtensions     = tostring(take_any(StagingExtensions)),
             ArchiveCount          = dcount(ArchiveName),
-            ArchiveNames          = make_set(ArchiveName, 5),
-            ArchiveFolders        = make_set(ArchiveFolderNorm, 3),
-            ArchiveProcesses      = make_set(ArchiveProcess, 3),
-            ArchiveCmdLines       = make_set(ArchiveCmdLine, 3),
-            TotalArchiveBytes     = sum(ArchiveSizeBytes),
+            ArchiveNames          = tostring(make_set(ArchiveName, 5)),
+            ArchiveFolders        = tostring(make_set(ArchiveFolderNorm, 3)),
+            ArchiveProcesses      = tostring(make_set(ArchiveProcess, 3)),
+            ArchiveParents        = tostring(make_set(ArchiveParent, 3)),
+            ArchiveCmdLines       = tostring(make_set(ArchiveCmdLine, 3)),
+            LargestArchiveMB      = round(max(ArchiveSizeBytes) / 1048576.0, 1),
+            TotalArchiveMB        = round(sum(ArchiveSizeBytes) / 1048576.0, 1),
             AnyArchiveUnusual     = max(ArchiveUnusual),
+            ArchiveUnderStaging   = max(ArchiveUnderStaging),
             FirstArchive          = min(ArchiveTime),
             LastArchive           = max(ArchiveTime),
             FirstStagedFile       = min(FirstStagedFile),
-            LastStagedFile        = max(LastStagedFile),
-            ArchiveUnderStaging   = max(ArchiveUnderStaging),
-            StagingUnderArchive   = max(StagingUnderArchive),
-            (LargestArchiveBytes, LargestArchiveName, LargestArchiveFolder,
-             LargestArchiveSha256, LargestArchiveProcess, LargestArchiveCmdLine)
-                = arg_max(ArchiveSizeBytes, ArchiveName, ArchiveFolderNorm,
-                          ArchiveSha256, ArchiveProcess, ArchiveCmdLine)
-    by DeviceId, DeviceName, AccountSid, AccountUpn
+            LastStagedFile        = max(LastStagedFile)
+    by DeviceId, DeviceName, AccountSid, AccountUpn,
+       RunWindow = bin(ArchiveTime, 30m)
 | extend FilesPerFolder      = round(StagedFileCount * 1.0 / StagingFolderCount, 1),
          StagingDurationMin  = round(datetime_diff('second', LastStagedFile, FirstStagedFile) / 60.0, 1),
-         GapToArchiveSeconds = datetime_diff('second', FirstArchive, LastStagedFile),
-         LargestArchiveMB    = round(LargestArchiveBytes / 1048576.0, 1),
-         TotalArchiveMB      = round(TotalArchiveBytes / 1048576.0, 1)
-// Entity-mapping helpers
-| extend AccountName   = tostring(split(AccountUpn, "@")[0]),
-         UpnSuffix     = tostring(split(AccountUpn, "@")[1]),
-         HashAlgorithm = "SHA256",
-         TimeGenerated = FirstArchive
-| project TimeGenerated, DeviceId, DeviceName, AccountSid, AccountUpn,
-          AccountName, UpnSuffix, MatchReason,
-          StagedFileCount, StagedUnusualCount, StagingFolderCount, FilesPerFolder,
-          StagingProcesses      = tostring(StagingProcesses),
-          StagingExtensions     = tostring(StagingExtensions),
-          StagingFolders        = tostring(StagingFolders),
-          StagingUnusualFolders = tostring(StagingUnusualFolders),
+         GapToArchiveSeconds = datetime_diff('second', FirstArchive, LastStagedFile)
+| project RunWindow, DeviceName, AccountUpn, MatchReason,
+          StagedFileCount, StagedUnusualCount, StagedAfterArchive,
+          StagingFolderCount, FilesPerFolder,
+          StagingProcesses, StagingExtensions, StagingFolders, StagingUnusualFolders,
           StagingDurationMin, GapToArchiveSeconds,
           ArchiveCount, LargestArchiveMB, TotalArchiveMB, AnyArchiveUnusual,
-          ArchiveProcesses      = tostring(ArchiveProcesses),
-          ArchiveNames          = tostring(ArchiveNames),
-          ArchiveFolders        = tostring(ArchiveFolders),
-          ArchiveCmdLines       = tostring(ArchiveCmdLines),
-          LargestArchiveName, LargestArchiveFolder, LargestArchiveSha256,
-          LargestArchiveCmdLine, HashAlgorithm,
-          ArchiveUnderStaging, StagingUnderArchive
-| order by TimeGenerated desc
+          ArchiveProcesses, ArchiveParents, ArchiveNames, ArchiveFolders,
+          ArchiveCmdLines, ArchiveUnderStaging,
+          FirstStagedFile, LastStagedFile, FirstArchive
+| order by RunWindow desc
