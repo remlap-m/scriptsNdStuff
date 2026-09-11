@@ -177,4 +177,10 @@ Deduped
     by ArchiveProcess = TopArchiveProc
 | order by Alerts desc
 | extend RunningTotal = row_cumsum(Alerts)
+
+
+
+
+
+
             
