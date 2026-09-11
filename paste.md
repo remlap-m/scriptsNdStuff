@@ -422,4 +422,127 @@ let DecompressionProcesses = dynamic([
     "tar.exe","peazip.exe","bandizip.exe","wzzip.exe","winzip32.exe","winzip64.exe",
     "zip.exe","unzip.exe"
 ]);
-// ---- Exclusions: populate
+// ---- Exclusions: populate from this output ----
+let ExcludedInitiatingProcesses = dynamic([]);
+let ExcludedFolderPathFragments = dynamic([]);
+let ExcludedAccountSids         = dynamic([]);
+let ExcludedDeviceNames         = dynamic([]);
+
+let ArchiveAnchors =
+    DeviceFileEvents
+    | where TimeGenerated between (ago(Lookback) .. now())
+    | where ActionType == "FileCreated"
+    | extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
+    | where Ext in (ArchiveExtensions)
+    | where tolower(InitiatingProcessFileName) in (ArchiverProcesses)
+    | extend AccountSid = tostring(InitiatingProcessAccountSid)
+    | where isnotempty(DeviceId) and isnotempty(AccountSid)
+    | where AccountSid !in (ExcludedAccountSids)
+    | where DeviceName !in~ (ExcludedDeviceNames)
+    | where ArchiveMinSizeBytes == 0 or tolong(FileSize) >= ArchiveMinSizeBytes
+    | extend ArchiveFolderNorm = tolower(iff(
+          tolower(FolderPath) endswith tolower(FileName),
+          substring(FolderPath, 0, strlen(FolderPath) - strlen(FileName) - 1),
+          FolderPath))
+    | extend ArchiveFolderNorm = trim_end(@"\\+", ArchiveFolderNorm)
+    | project ArchiveTime = TimeGenerated, DeviceId, DeviceName, AccountSid,
+              AccountUpn      = InitiatingProcessAccountUpn,
+              ArchiveName     = FileName,
+              ArchiveFolderNorm,
+              ArchiveSizeBytes= tolong(FileSize),
+              ArchiveProcess  = InitiatingProcessFileName,
+              ArchiveCmdLine  = InitiatingProcessCommandLine;
+
+let ArchiveKeyed =
+    ArchiveAnchors
+    | mv-expand JoinBucket = pack_array(
+          bin(ArchiveTime, StagingWindow),
+          bin(ArchiveTime, StagingWindow) - StagingWindow
+      ) to typeof(datetime);
+
+let StagingEvents =
+    DeviceFileEvents
+    | where TimeGenerated between (ago(Lookback) .. now())
+    | where ActionType == "FileCreated"
+    | extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
+    | where Ext in (DocExtensions)
+    | extend AccountSid = tostring(InitiatingProcessAccountSid),
+             InitProc   = tolower(InitiatingProcessFileName)
+    | where isnotempty(DeviceId) and isnotempty(AccountSid)
+    | where InitProc !in (DecompressionProcesses)
+    | where InitProc !in (ExcludedInitiatingProcesses)
+    | where array_length(ExcludedFolderPathFragments) == 0
+         or not(tolower(FolderPath) has_any (ExcludedFolderPathFragments))
+    | extend StageFolderNorm = tolower(iff(
+          tolower(FolderPath) endswith tolower(FileName),
+          substring(FolderPath, 0, strlen(FolderPath) - strlen(FileName) - 1),
+          FolderPath))
+    | extend StageFolderNorm = trim_end(@"\\+", StageFolderNorm)
+    | project StageTime    = TimeGenerated,
+              DeviceId, AccountSid,
+              StagePath    = FolderPath,
+              StageFolderNorm,
+              StageProcess = InitiatingProcessFileName,
+              StageExt     = Ext,
+              JoinBucket   = bin(TimeGenerated, StagingWindow);
+
+let Correlated =
+    ArchiveKeyed
+    | join kind=inner hint.shufflekey=DeviceId (StagingEvents)
+        on DeviceId, AccountSid, JoinBucket
+    | where StageTime < ArchiveTime
+    | where StageTime >= ArchiveTime - StagingWindow
+    | extend SameTree = iff(
+          ArchiveFolderNorm startswith StageFolderNorm
+       or StageFolderNorm  startswith ArchiveFolderNorm, 1, 0)
+    | summarize StagedFileCount      = count_distinct(StagePath),
+                StagingFolderCount   = count_distinct(StageFolderNorm),
+                StagingFolders       = make_set(StageFolderNorm, 5),
+                StagingProcesses     = make_set(StageProcess, 5),
+                StagingExtensions    = make_set(StageExt, 6),
+                FirstStagedFile      = min(StageTime),
+                LastStagedFile       = max(StageTime),
+                ArchiveInStagingTree = max(SameTree)
+        by ArchiveTime, DeviceId, DeviceName, AccountSid, AccountUpn,
+           ArchiveName, ArchiveFolderNorm, ArchiveSizeBytes,
+           ArchiveProcess, ArchiveCmdLine;
+
+// ---------- ONE ROW PER ALERT ----------
+Correlated
+| where StagedFileCount >= StagingFileThreshold
+| summarize StagedFileCount      = max(StagedFileCount),
+            StagingFolderCount   = max(StagingFolderCount),
+            StagingFolders       = take_any(StagingFolders),
+            StagingProcesses     = take_any(StagingProcesses),
+            StagingExtensions    = take_any(StagingExtensions),
+            ArchiveCount         = dcount(ArchiveName),
+            ArchiveNames         = make_set(ArchiveName, 5),
+            ArchiveFolders       = make_set(ArchiveFolderNorm, 3),
+            ArchiveProcesses     = make_set(ArchiveProcess, 3),
+            ArchiveCmdLines      = make_set(ArchiveCmdLine, 2),
+            LargestArchiveMB     = round(max(ArchiveSizeBytes) / 1048576.0, 1),
+            TotalArchiveMB       = round(sum(ArchiveSizeBytes) / 1048576.0, 1),
+            FirstArchive         = min(ArchiveTime),
+            LastArchive          = max(ArchiveTime),
+            FirstStagedFile      = min(FirstStagedFile),
+            LastStagedFile       = max(LastStagedFile),
+            ArchiveInStagingTree = max(ArchiveInStagingTree)
+    by DeviceId, DeviceName, AccountSid, AccountUpn,
+       RunWindow = bin(ArchiveTime, 30m)
+| extend FilesPerFolder      = round(StagedFileCount * 1.0 / StagingFolderCount, 1),
+         StagingDurationMin  = round(datetime_diff('second', LastStagedFile, FirstStagedFile) / 60.0, 1),
+         GapToArchiveSeconds = datetime_diff('second', FirstArchive, LastStagedFile)
+| project RunWindow, DeviceName, AccountUpn,
+          StagedFileCount, StagingFolderCount, FilesPerFolder,
+          StagingProcesses  = tostring(StagingProcesses),
+          StagingExtensions = tostring(StagingExtensions),
+          StagingFolders    = tostring(StagingFolders),
+          StagingDurationMin, GapToArchiveSeconds,
+          ArchiveCount, LargestArchiveMB, TotalArchiveMB,
+          ArchiveProcesses  = tostring(ArchiveProcesses),
+          ArchiveNames      = tostring(ArchiveNames),
+          ArchiveFolders    = tostring(ArchiveFolders),
+          ArchiveInStagingTree,
+          FirstStagedFile, LastStagedFile, FirstArchive,
+          ArchiveCmdLines   = tostring(ArchiveCmdLines)
+| order by RunWindow desc
