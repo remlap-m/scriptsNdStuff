@@ -126,3 +126,77 @@ Correlated
             SampleDevice    = any(DeviceName)
     by SimulatedRunWindow = bin(ArchiveTime, SimBucket)
 | order by SimulatedRunWindow asc
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+DeviceFileEvents
+| where TimeGenerated > ago(7d)
+| where ActionType in ("FileCreated", "FileRenamed")
+| extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
+| where Ext in ("zip","zipx","7z","rar","tar","gz","tgz","bz2","xz","cab","iso","arj","lzh")
+| summarize Events    = count(),
+            Devices   = dcount(DeviceId),
+            WithSid   = countif(isnotempty(InitiatingProcessAccountSid)),
+            MedSizeMB = round(percentile(tolong(FileSize), 50) / 1048576.0, 2),
+            MaxSizeMB = round(max(tolong(FileSize)) / 1048576.0, 2)
+    by Ext, ActionType
+| order by Events desc
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+let DocExtensions = dynamic([
+    "doc","docx","docm","dot","dotx","xls","xlsx","xlsm","xlsb",
+    "ppt","pptx","pptm","pdf","csv","txt","rtf","odt","ods","odp",
+    "msg","eml","one","vsd","vsdx"
+]);
+DeviceFileEvents
+| where TimeGenerated > ago(7d)
+| where ActionType == "FileCreated"
+| extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
+| where Ext in (DocExtensions)
+| extend AccountSid = tostring(InitiatingProcessAccountSid)
+| summarize FileCount   = count_distinct(strcat(FolderPath, "\\", FileName)),
+            FolderCount = count_distinct(FolderPath)
+    by DeviceId, AccountSid, Bucket = bin(TimeGenerated, 30m)
+| summarize TotalBuckets          = count(),
+            MaxFiles              = max(FileCount),
+            P99Files              = percentile(FileCount, 99),
+            P95Files              = percentile(FileCount, 95),
+            Over200Files          = countif(FileCount >= 200),
+            Over200AndUnder5Fldrs = countif(FileCount >= 200 and FolderCount <= 5),
+            Over100AndUnder5Fldrs = countif(FileCount >= 100 and FolderCount <= 5),
+            Over50AndUnder10Fldrs = countif(FileCount >= 50  and FolderCount <= 10)
+
+
+
+
+
+
+            
+
+
