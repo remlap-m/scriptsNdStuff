@@ -169,3 +169,58 @@ Alerts
 | summarize MatchReasons = make_set(MatchReason)
     by DeviceId, DeviceName, AccountSid, AccountUpn, RunWindow = bin(ArchiveTime, 30m)
 | summarize DedupedAlerts = count(), Devices = dcount(DeviceId), Accounts = dcount(AccountSid)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Alerts
+| summarize MaxStaged = max(StagedFileCount)
+    by DeviceId, AccountSid, MatchReason, RunWindow = bin(ArchiveTime, 30m)
+| summarize Alerts = count(), Devices = dcount(DeviceId) by MatchReason
+
+
+
+
+
+
+Alerts
+| summarize MatchReasons        = tostring(make_set(MatchReason)),
+            StagedFileCount     = max(StagedFileCount),
+            StagedUnusualCount  = max(StagedUnusualCount),
+            StagingFolderCount  = max(StagingFolderCount),
+            StagingFolders      = tostring(take_any(StagingFolders)),
+            StagingUnusualFolders = tostring(take_any(StagingUnusualFolders)),
+            StagingProcesses    = tostring(take_any(StagingProcesses)),
+            ArchiveCount        = dcount(ArchiveName),
+            ArchiveNames        = tostring(make_set(ArchiveName, 5)),
+            ArchiveFolders      = tostring(make_set(ArchiveFolderNorm, 3)),
+            ArchiveProcesses    = tostring(make_set(ArchiveProcess, 3)),
+            ArchiveCmdLines     = tostring(make_set(ArchiveCmdLine, 3)),
+            LargestArchiveMB    = round(max(ArchiveSizeBytes) / 1048576.0, 1),
+            AnyArchiveUnusual   = max(ArchiveUnusual),
+            FirstArchive        = min(ArchiveTime),
+            LastStagedFile      = max(LastStagedFile),
+            StagingUnderArchive = max(StagingUnderArchive)
+    by DeviceId, DeviceName, AccountSid, AccountUpn, RunWindow = bin(ArchiveTime, 30m)
+| extend GapToArchiveSeconds = datetime_diff('second', FirstArchive, LastStagedFile)
+| order by RunWindow desc
+
+
+
+
+
