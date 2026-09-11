@@ -1,35 +1,7 @@
-let ArchiveExtensions = dynamic(["zip","zipx","7z","rar","tar","gz","tgz","bz2","xz","cab","iso","arj","lzh"]);
-let ArchiverProcesses = dynamic([
-    "7z.exe","7zg.exe","7zfm.exe","7za.exe","winrar.exe","rar.exe",
-    "peazip.exe","bandizip.exe","wzzip.exe","winzip32.exe","winzip64.exe",
-    "tar.exe","zip.exe","makecab.exe","explorer.exe",
-    "powershell.exe","pwsh.exe","cmd.exe","python.exe","wscript.exe","cscript.exe"]);
-DeviceFileEvents
-| where TimeGenerated > ago(7d)
-| where ActionType == "FileCreated"
-| extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
-| where Ext in (ArchiveExtensions)
-| where InitiatingProcessFileName in~ (ArchiverProcesses)
-| where tolong(FileSize) >= 10485760
-| extend FolderNorm = tolower(iff(
-      tolower(FolderPath) endswith tolower(FileName),
-      substring(FolderPath, 0, strlen(FolderPath) - strlen(FileName) - 1),
-      FolderPath))
-// generalise user paths so they aggregate
-| extend PathClass = replace_regex(FolderNorm, @"^c:\\users\\[^\\]+\\", @"c:\users\<user>\")
-| summarize Events = count(), Devices = dcount(DeviceId), Accounts = dcount(InitiatingProcessAccountSid)
-    by PathClass, InitiatingProcessFileName
-| order by Events desc
-| take 50
-
-
-
-
-
-
 //=====================================================================
-// REVERSE VARIANT HARNESS — staging anywhere, archiving in odd location
-// 7-day backtest. NOT an analytics rule. No archive-location exclusions.
+// MERGED HARNESS — staging + archiving, unusual on either side
+// 7-day backtest. NOT an analytics rule.
+// Fires when: staging in unusual location OR archiving in unusual location
 //=====================================================================
 
 let Lookback             = 7d;
@@ -57,13 +29,12 @@ let DecompressionProcesses = dynamic([
     "zip.exe","unzip.exe"
 ]);
 
-// ---- Archive-location allow-list: POPULATE FROM THE BASELINE QUERY ----
-// Leave empty for the first pass. Use <user> placeholder form, e.g.
-//   @"c:\users\<user>\documents", @"c:\users\<user>\downloads"
-let NormalArchiveLocations = dynamic([]);
+// Normal user-document locations. Used on BOTH sides now — staging in
+// these is "normal location", archiving into these is "normal destination".
+let UserDocRegex = @"(?i)C:\\Users\\[^\\]+\\(Documents|Downloads|Desktop|OneDrive - ORG NAME HERE|OneDrive - ORG NAME|ORG NAME)(\\|$)";
 
 //---------------------------------------------------------------------
-// BLOCK 1 — Archive anchors. Location constraint lives HERE now.
+// BLOCK 1 — Archive anchors. Location is now a FLAG, not a filter.
 //---------------------------------------------------------------------
 let ArchiveAnchors =
     DeviceFileEvents
@@ -73,7 +44,7 @@ let ArchiveAnchors =
     | where Ext in (ArchiveExtensions)
     | where InitiatingProcessFileName in~ (ArchiverProcesses)
     | where ArchiveMinSizeBytes == 0 or tolong(FileSize) >= ArchiveMinSizeBytes
-    // OneDrive "download as zip" multipart extraction — keep this one
+    // OneDrive "download as zip" multipart extraction — noise, stays a filter
     | where not(InitiatingProcessFileName in~ ("explorer.exe","onedrive.exe")
             and FolderPath has @"\appdata\local\temp\"
             and FolderPath matches regex @"\.zip\.[0-9a-f]{3}\\")
@@ -84,16 +55,14 @@ let ArchiveAnchors =
           substring(FolderPath, 0, strlen(FolderPath) - strlen(FileName) - 1),
           FolderPath))
     | extend ArchiveFolderNorm = trim_end(@"\\+", ArchiveFolderNorm)
-    // generalised form for allow-list matching across users
-    | extend ArchivePathClass = replace_regex(ArchiveFolderNorm, @"^c:\\users\\[^\\]+\\", @"c:\users\<user>\")
-    | where array_length(NormalArchiveLocations) == 0
-         or not(ArchivePathClass has_any (NormalArchiveLocations))
+    | extend ArchiveUnusual = iff(FolderPath matches regex UserDocRegex, 0, 1)
     | project ArchiveTime      = TimeGenerated,
               DeviceId, DeviceName, AccountSid,
               AccountUpn       = InitiatingProcessAccountUpn,
               ArchiveName      = FileName,
-              ArchiveFolderNorm, ArchivePathClass,
+              ArchiveFolderNorm, ArchiveUnusual,
               ArchiveSizeBytes = tolong(FileSize),
+              ArchiveSha256    = SHA256,
               ArchiveProcess   = InitiatingProcessFileName,
               ArchiveCmdLine   = InitiatingProcessCommandLine;
 
@@ -105,7 +74,8 @@ let ArchiveKeyed =
       ) to typeof(datetime);
 
 //---------------------------------------------------------------------
-// BLOCK 2 — Staging. NO path exclusions: staging anywhere counts.
+// BLOCK 2 — Staging. App-specific exclusions stay as FILTERS.
+// User-doc location becomes a FLAG.
 //---------------------------------------------------------------------
 let StagingEvents =
     DeviceFileEvents
@@ -115,6 +85,27 @@ let StagingEvents =
     | where Ext in (DocExtensions)
     | extend InitProc = tolower(InitiatingProcessFileName)
     | where InitProc !in (DecompressionProcesses)
+    | where FolderPath startswith "C:\\"
+    | where not(FolderPath startswith "C:\\$Recycle.Bin")
+    // --- Application noise exclusions (keep as filters) ---
+    | where not(FolderPath has @"\appdata\local\microsoft\windows\inetcache"
+            and InitiatingProcessFileName in~ ("outlook.exe","winword.exe","msedge.exe"))
+    | where not(FolderPath has @"\appdata\local\temp\scrub"
+            and InitiatingProcessFileName =~ "outlook.exe")
+    | where not(FolderPath has @"\appdata\local\microsoft\capture\logs"
+            and InitiatingProcessFileName =~ "capture.exe")
+    | where not(FolderPath startswith "C:\\programdata\\APPNAME3\\APP NAME FOLDER.NAME"
+            and InitiatingProcessFileName =~ "APP.NAME3.SERVICE.app.exe")
+    | where not(FolderPath matches regex @"(?i)C:\\Users\\[^\\]+\\FOLDER NAME1(\\|$)"
+            and InitiatingProcessFileName =~ "APPNAME2.exe")
+    | where not((FolderPath matches regex @"(?i)C:\\Users\\[^\\]+\\APPNAME1(\\|$)"
+                 or FolderPath startswith "C:\\Temp\\")
+            and InitiatingProcessFileName =~ "APPNAME1.exe")
+    | where not(FolderPath startswith "C:\\programdata\\templateupdates"
+            and InitiatingProcessFileName =~ "powershell.exe")
+    | where not(InitiatingProcessFileName in~ ("explorer.exe","onedrive.exe")
+            and FolderPath has @"\appdata\local\temp\"
+            and FolderPath matches regex @"\.zip\.[0-9a-f]{3}\\")
     | extend AccountSid = tostring(InitiatingProcessAccountSid)
     | where isnotempty(DeviceId) and isnotempty(AccountSid)
     | extend StageFolderNorm = tolower(iff(
@@ -122,10 +113,11 @@ let StagingEvents =
           substring(FolderPath, 0, strlen(FolderPath) - strlen(FileName) - 1),
           FolderPath))
     | extend StageFolderNorm = trim_end(@"\\+", StageFolderNorm)
+    | extend StageUnusual = iff(FolderPath matches regex UserDocRegex, 0, 1)
     | project StageTime    = TimeGenerated,
               DeviceId, AccountSid,
               StagePath    = FolderPath,
-              StageFolderNorm,
+              StageFolderNorm, StageUnusual,
               StageProcess = InitiatingProcessFileName,
               StageExt     = Ext,
               JoinBucket   = bin(TimeGenerated, StagingWindow);
@@ -141,84 +133,39 @@ let Correlated =
     | where StageTime >= ArchiveTime - StagingWindow
     | extend ArchiveUnderStaging = iff(ArchiveFolderNorm startswith StageFolderNorm, 1, 0),
              StagingUnderArchive = iff(StageFolderNorm startswith ArchiveFolderNorm, 1, 0)
-    | summarize StagedFileCount      = count_distinct(StagePath),
-                StagingFolderCount   = count_distinct(StageFolderNorm),
-                StagingFolders       = make_set(StageFolderNorm, 5),
-                StagingProcesses     = make_set(StageProcess, 5),
-                StagingExtensions    = make_set(StageExt, 6),
-                FirstStagedFile      = min(StageTime),
-                LastStagedFile       = max(StageTime),
-                ArchiveUnderStaging  = max(ArchiveUnderStaging),
-                StagingUnderArchive  = max(StagingUnderArchive)
+    | summarize StagedFileCount       = count_distinct(StagePath),
+                StagedUnusualCount    = count_distinctif(StagePath, StageUnusual == 1),
+                StagingFolderCount    = count_distinct(StageFolderNorm),
+                StagingFolders        = make_set(StageFolderNorm, 5),
+                StagingUnusualFolders = make_setif(StageFolderNorm, StageUnusual == 1, 5),
+                StagingProcesses      = make_set(StageProcess, 5),
+                StagingExtensions     = make_set(StageExt, 6),
+                FirstStagedFile       = min(StageTime),
+                LastStagedFile        = max(StageTime),
+                ArchiveUnderStaging   = max(ArchiveUnderStaging),
+                StagingUnderArchive   = max(StagingUnderArchive)
         by ArchiveTime, DeviceId, DeviceName, AccountSid, AccountUpn,
-           ArchiveName, ArchiveFolderNorm, ArchivePathClass, ArchiveSizeBytes,
-           ArchiveProcess, ArchiveCmdLine;
+           ArchiveName, ArchiveFolderNorm, ArchiveUnusual, ArchiveSizeBytes,
+           ArchiveSha256, ArchiveProcess, ArchiveCmdLine;
 
 //---------------------------------------------------------------------
-// BLOCK 4 — VOLUME. Swap this out for the other views below.
+// BLOCK 4 — Union of both rules. Nothing looser.
 //---------------------------------------------------------------------
-Correlated
-| where StagedFileCount >= StagingFileThreshold
-| summarize MaxStaged = max(StagedFileCount)
-    by DeviceId, DeviceName, AccountSid, AccountUpn,
-       RunWindow = bin(ArchiveTime, 30m)
-| summarize DedupedAlerts = count(),
-            Devices       = dcount(DeviceId),
-            Accounts      = dcount(AccountSid)
+let Alerts =
+    Correlated
+    // Branch A (forward): enough files staged in UNUSUAL locations
+    // Branch B (reverse): enough files staged ANYWHERE + archive unusual
+    | where StagedUnusualCount >= StagingFileThreshold
+         or (ArchiveUnusual == 1 and StagedFileCount >= StagingFileThreshold)
+    | extend MatchReason = case(
+          StagedUnusualCount >= StagingFileThreshold and ArchiveUnusual == 1, "Both",
+          StagedUnusualCount >= StagingFileThreshold,                         "StagingUnusual",
+                                                                              "ArchiveUnusual");
 
-
-
-
-Correlated
-| where StagedFileCount >= StagingFileThreshold
-| summarize MaxStaged = max(StagedFileCount)
-    by DeviceId, AccountSid, ArchivePathClass,
-       ArchiveProcess = tolower(ArchiveProcess),
-       RunWindow = bin(ArchiveTime, 30m)
-| summarize Alerts = count(), Devices = dcount(DeviceId), Accounts = dcount(AccountSid)
-    by ArchivePathClass, ArchiveProcess
-| order by Alerts desc
-| extend RunningTotal = row_cumsum(Alerts)
-
-
-
-
-
-Correlated
-| where StagedFileCount >= StagingFileThreshold
-| summarize StagedFileCount    = max(StagedFileCount),
-            StagingFolderCount = max(StagingFolderCount),
-            StagingFolders     = take_any(StagingFolders),
-            StagingProcesses   = take_any(StagingProcesses),
-            ArchiveCount       = dcount(ArchiveName),
-            ArchiveNames       = make_set(ArchiveName, 5),
-            ArchiveFolders     = make_set(ArchiveFolderNorm, 3),
-            ArchiveProcesses   = make_set(ArchiveProcess, 3),
-            ArchiveCmdLines    = make_set(ArchiveCmdLine, 3),
-            LargestArchiveMB   = round(max(ArchiveSizeBytes) / 1048576.0, 1),
-            FirstArchive       = min(ArchiveTime),
-            LastStagedFile     = max(LastStagedFile),
-            StagingUnderArchive = max(StagingUnderArchive)
-    by DeviceId, DeviceName, AccountSid, AccountUpn,
-       RunWindow = bin(ArchiveTime, 30m)
-| extend GapToArchiveSeconds = datetime_diff('second', FirstArchive, LastStagedFile)
-| project RunWindow, DeviceName, AccountUpn, StagedFileCount, StagingFolderCount,
-          StagingFolders   = tostring(StagingFolders),
-          StagingProcesses = tostring(StagingProcesses),
-          GapToArchiveSeconds, ArchiveCount, LargestArchiveMB,
-          ArchiveFolders   = tostring(ArchiveFolders),
-          ArchiveProcesses = tostring(ArchiveProcesses),
-          ArchiveNames     = tostring(ArchiveNames),
-          ArchiveCmdLines  = tostring(ArchiveCmdLines),
-          StagingUnderArchive
-| order by RunWindow desc
-
-
-
-
-
-
-
-
-
-            
+//---------------------------------------------------------------------
+// BLOCK 5 — VOLUME. Swap for the views below.
+//---------------------------------------------------------------------
+Alerts
+| summarize MatchReasons = make_set(MatchReason)
+    by DeviceId, DeviceName, AccountSid, AccountUpn, RunWindow = bin(ArchiveTime, 30m)
+| summarize DedupedAlerts = count(), Devices = dcount(DeviceId), Accounts = dcount(AccountSid)
