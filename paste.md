@@ -556,16 +556,11 @@ Correlated
 
 
 
-DeviceFileEvents
-| where TimeGenerated > ago(7d)
-| where ActionType == "FileCreated"
-| where FolderPath has @"\appdata\local\temp\"
-| where FolderPath has_any ("onedrive","outlook")
-| project FolderPath, FileName, InitiatingProcessFileName
-| take 30
-
-
-
+| where not(
+      InitiatingProcessFileName in~ ("explorer.exe","onedrive.exe")
+      and tolower(FolderPath) has @"\appdata\local\temp\"
+      and tolower(FolderPath) matches regex @"\.zip\.[0-9a-f]{3}\\"
+  )
 
 ***********
 
