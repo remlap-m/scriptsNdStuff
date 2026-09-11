@@ -208,3 +208,47 @@ Hits
           ArchiveCmdLines, ArchiveUnderStaging,
           FirstStagedFile, LastStagedFile, FirstArchive
 | order by RunWindow desc
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+let StagingWindow  = 30m;
+let OrderTolerance = 60m;
+let TestDevice = "MYDEVICE";
+let A = DeviceFileEvents
+    | where TimeGenerated > ago(6h)
+    | where DeviceName =~ TestDevice
+    | where ActionType == "FileCreated"
+    | extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
+    | where Ext in ("zip","7z","rar","zipx")
+    | extend AccountSid = tostring(InitiatingProcessAccountSid)
+    | project ArchiveTime = TimeGenerated, DeviceId, AccountSid, ArchiveName = FileName,
+              ArchiveFolder = FolderPath, ArchiveProc = InitiatingProcessFileName,
+              ArchiveMB = round(tolong(FileSize)/1048576.0, 1);
+let S = DeviceFileEvents
+    | where TimeGenerated > ago(6h)
+    | where DeviceName =~ TestDevice
+    | where ActionType == "FileCreated"
+    | extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
+    | where Ext in ("doc","docx","pdf","txt","xlsx")
+    | extend AccountSid = tostring(InitiatingProcessAccountSid)
+    | project StageTime = TimeGenerated, DeviceId, AccountSid,
+              StagePath = FolderPath, StageProc = InitiatingProcessFileName;
+A | join kind=inner (S) on DeviceId, AccountSid
+  | where StageTime < ArchiveTime + OrderTolerance
+  | where StageTime >= ArchiveTime - StagingWindow
+  | summarize StagedFiles = count_distinct(StagePath),
+              MinGapSec = min(datetime_diff('second', ArchiveTime, StageTime)),
+              MaxGapSec = max(datetime_diff('second', ArchiveTime, StageTime))
+      by ArchiveName, ArchiveFolder, ArchiveMB, ArchiveProc, ArchiveTime
