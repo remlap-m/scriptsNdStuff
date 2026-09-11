@@ -374,3 +374,52 @@ Correlated
 | summarize Alerts = count(), Devices = dcount(DeviceId), Accounts = dcount(AccountSid)
     by ArchiveProcess
 | order by Alerts desc
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//=====================================================================
+// ALERT PREVIEW — staging followed by archiving
+// One row = one incident. 7-day backtest, 30-min windows.
+// NOT an analytics rule. No exclusions applied.
+//=====================================================================
+
+let Lookback             = 7d;
+let StagingWindow        = 30m;
+let StagingFileThreshold = 100;
+let ArchiveMinSizeBytes  = 0;
+
+let DocExtensions = dynamic([
+    "doc","docx","docm","dot","dotx","xls","xlsx","xlsm","xlsb",
+    "ppt","pptx","pptm","pdf","csv","txt","rtf","odt","ods","odp",
+    "msg","eml","one","vsd","vsdx"
+]);
+let ArchiveExtensions = dynamic([
+    "zip","zipx","7z","rar","tar","gz","tgz","bz2","xz","cab","iso","arj","lzh"
+]);
+let ArchiverProcesses = dynamic([
+    "7z.exe","7zg.exe","7zfm.exe","7za.exe","winrar.exe","rar.exe",
+    "peazip.exe","bandizip.exe","wzzip.exe","winzip32.exe","winzip64.exe",
+    "tar.exe","zip.exe","makecab.exe","explorer.exe",
+    "powershell.exe","pwsh.exe","cmd.exe","python.exe","wscript.exe","cscript.exe"
+]);
+let DecompressionProcesses = dynamic([
+    "7z.exe","7zg.exe","7zfm.exe","7za.exe","winrar.exe","rar.exe","unrar.exe",
+    "tar.exe","peazip.exe","bandizip.exe","wzzip.exe","winzip32.exe","winzip64.exe",
+    "zip.exe","unzip.exe"
+]);
+// ---- Exclusions: populate
