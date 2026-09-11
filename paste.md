@@ -217,4 +217,20 @@ DeviceFileEvents
 | summarize Events = count() by SizeBucket, ActionType
 | order by Events desc
 
+
+
+
+
+
+DeviceFileEvents
+| where TimeGenerated > ago(7d)
+| where ActionType == "FileCreated"
+| extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
+| where Ext in ("zip","7z","rar","zipx")
+| where tolong(FileSize) between (52428800 .. 262144000)
+| summarize Events = count(),
+            Devices = dcount(DeviceId),
+            DistinctFiles = dcount(strcat(DeviceId, "|", FolderPath))
+| extend EventsPerFile = round(Events * 1.0 / DistinctFiles, 1)
+
             
