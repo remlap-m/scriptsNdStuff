@@ -181,6 +181,23 @@ Deduped
 
 
 
+Correlated
+| where StagedFileCount >= 100
+| mv-expand StagingProcessSample to typeof(string)
+| summarize Rows       = count(),
+            Devices    = dcount(DeviceId),
+            Accounts   = dcount(AccountSid),
+            MaxStaged  = max(StagedFileCount),
+            SampleArc  = any(ArchiveName),
+            SampleFldr = any(ArchiveFolderNorm)
+    by StagingProcess = tolower(tostring(StagingProcessSample)),
+       ArchiveProcess = tolower(ArchiveProcess)
+| order by Rows desc
+| take 30
+
+
+
+
 
 
             
