@@ -1,13 +1,14 @@
 //==========================================================================
-// HUNT: Bulk document creation by anomalous process, with staging escalator
-// Window: 7 days, bucketed to match scheduled-rule burst windows
+// HUNT: Bulk document creation by listed process, 7 days, burst-bucketed
+// Run 1: MinFileCount = 1  -> distribution, derive threshold
+// Run 2: MinFileCount = <derived> -> approximate alert volume
 //==========================================================================
 let Lookback            = 7d;
-let BurstWindow         = 10m;    // TUNE - burst bucket size
-let MinFileCount        = 40;     // TUNE - deliberately low (emission ceiling)
-let ArchivePriorWindow  = 30m;    // how far back an archive suppresses
-let ArchiveFollowWindow = 2h;     // how far forward an archive escalates
-let OrderTrustCeiling   = 500;    // TUNE - above this, distrust temporal order
+let BurstWindow         = 10m;   // UNVALIDATED PLACEHOLDER
+let MinFileCount        = 1;     // UNVALIDATED - set 1 for distribution run
+let ArchivePriorWindow  = 30m;   // UNVALIDATED PLACEHOLDER
+let ArchiveFollowWindow = 2h;    // UNVALIDATED PLACEHOLDER
+let OrderTrustCeiling   = 500;   // DERIVED from local testing: 600 clean, 3000 reordered
 //
 let DocExtensions = dynamic(["docx","doc","docm","xlsx","xls","xlsm","xlsb","pptx","ppt","pptm",
                              "pdf","csv","rtf","odt","ods","odp","msg","eml","pst","ost","one",
@@ -19,11 +20,8 @@ let SuspectProcesses = dynamic(["robocopy.exe","xcopy.exe","powershell.exe","pws
                                 "bitsadmin.exe","esentutl.exe","forfiles.exe","curl.exe","wget.exe",
                                 "wmic.exe","ftp.exe","python.exe"]);
 let ExcludedAccounts = dynamic(["system","local service","network service","localsystem","-"]);
-// PLACEHOLDER - replace with your service-account naming convention
-let ServiceAcctRegex = @"^(svc|sa|adm|_)[-_.]";
-// PLACEHOLDER - replace with a device-group join if you have one
-let ExcludedDeviceRegex = @"^(srv|bld|vdi|sccm|mgmt)-";
-// TUNE - extraction verbs
+let ServiceAcctRegex    = @"^(svc|sa|adm|_)[-_.]";        // PLACEHOLDER - your convention
+let ExcludedDeviceRegex = @"^(srv|bld|vdi|sccm|mgmt)-";   // PLACEHOLDER - prefer a device-group join
 let ExtractionVerbs = @"(?i)(expand-archive|7z[a]?\s+[xe]\b|\brar\s+[xe]\b|\bunzip\b|tar\s+[^|]*-?x|extractto|\bexpand\s+-)";
 //
 let ScopedCreates =
@@ -34,7 +32,10 @@ let ScopedCreates =
     | extend FileExt = tolower(extract(@"\.([A-Za-z0-9]+)$", 1, FileName))
     | where FileExt in (DocExtensions)
     | extend InitProc = tolower(InitiatingProcessFileName)
-    | where InitProc in (SuspectProcesses)
+    // [VERSIONINFO] delete next 2 lines if the field is absent in your tenant
+    | extend InitProcOriginal = tolower(tostring(InitiatingProcessVersionInfoOriginalFileName))
+    | extend NameMismatch = isnotempty(InitProcOriginal) and InitProcOriginal != InitProc
+    | where InitProc in (SuspectProcesses) or InitProcOriginal in (SuspectProcesses)
     | extend Acct = tolower(InitiatingProcessAccountName)
     | where Acct !in (ExcludedAccounts)
     | where Acct !endswith "$"
@@ -49,6 +50,8 @@ let Bursts =
         DistinctFolders    = dcount(FolderPath),
         DistinctExts       = dcount(FileExt),
         ExtractionCmdCount = countif(IsExtractionCmd),
+        MismatchCount      = countif(NameMismatch),          // [VERSIONINFO] delete if field absent
+        OriginalNames      = make_set(InitProcOriginal, 3),  // [VERSIONINFO] delete if field absent
         NetworkWrites      = countif(FolderPath startswith "\\\\"),
         TempWrites         = countif(FolderPath has @"\AppData\Local\Temp" or FolderPath has @"\Windows\Temp"),
         AppDataWrites      = countif(FolderPath has @"\AppData\"),
@@ -105,44 +108,14 @@ Bursts
       ArchivePriorCount > 0 and FileCount <  OrderTrustCeiling,
           "SUPPRESS - archive precedes burst",
       ArchivePriorCount > 0 and FileCount >= OrderTrustCeiling,
-          "ALERT - archive precedes, but volume exceeds order-trust ceiling",
+          "ALERT - archive precedes, volume above order-trust ceiling",
           "ALERT")
-| extend Severity = case(
-      Verdict startswith "SUPPRESS",                      "n/a",
-      ArchiveFollowCount > 0 and NetworkWrites > 0,       "High",
-      ArchiveFollowCount > 0,                             "High",
-      NetworkWrites > 0,                                  "Medium-High",
-      TempWrites + AppDataWrites + PublicWrites > 0,      "Medium",
-                                                          "Medium")
 | where Verdict startswith "ALERT"
-| project BurstStart, DeviceName, Acct, InitProc, FileCount, FilesPerMin, BurstSpanSec,
-          DistinctFolders, DistinctExts, NetworkWrites, TempWrites, AppDataWrites, PublicWrites,
+| project BurstStart, DeviceName, Acct, InitProc, MismatchCount, OriginalNames,
+          FileCount, FilesPerMin, BurstSpanSec, DistinctFolders, DistinctExts,
+          NetworkWrites, TempWrites, AppDataWrites, PublicWrites,
           ArchiveFollowCount, FollowingArchives, FollowingArchProcs,
           ArchivePriorCount, PriorArchives,
-          Verdict, Severity, FirstCreate, LastCreate,
+          Verdict, FirstCreate, LastCreate,
           SampleFolders, SampleFiles, CmdSample, ProcPaths, DeviceId, BurstKey
-| sort by BurstStart desc
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// Raw burst count (what the rule would fire on with no grouping)
-| summarize AlertBursts = count()
-
-// After device+account grouping over 4h (closer to real incident count)
-| summarize by DeviceId, Acct, GroupWindow = bin(BurstStart, 4h)
-| summarize GroupedIncidents = count()
-
-// Noise profile - what's driving volume
-| summarize Bursts = count(), TotalFiles = sum(FileCount) by InitProc, DeviceName
-| sort by Bursts desc
+| sort by FileCount desc
