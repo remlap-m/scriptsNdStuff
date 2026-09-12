@@ -1,254 +1,148 @@
-//=====================================================================
-// HUNT — Document staging and archiving in unusual locations
-// 7-day retrospective. Ordering tolerance replaces strict ordering
-// to accommodate observed MDE timestamp skew on bulk file operations.
-//=====================================================================
-
-let Lookback             = 7d;
-let StagingWindow        = 30m;
-let OrderTolerance       = 15m;        // staging may report AFTER archive
-let StagingFileThreshold = 100;        // NOTE: unreliable at volume — see caveats
-let ArchiveMinSizeBytes  = 10485760;   // 10 MB
-
-let UserDocRegex = @"(?i)C:\\Users\\[^\\]+\\(Documents|Downloads|Desktop|OneDrive - ORG NAME HERE|OneDrive - ORG NAME|ORG NAME)(\\|$)";
-
-let DocExtensions = dynamic([
-    "doc","docx","docm","dot","dotx","xls","xlsx","xlsm","xlsb",
-    "ppt","pptx","pptm","pdf","csv","txt","rtf","odt","ods","odp",
-    "msg","eml","one","vsd","vsdx"
-]);
-let ArchiveExtensions = dynamic([
-    "zip","zipx","7z","rar","tar","gz","tgz","bz2","xz","cab","iso","arj","lzh"
-]);
-let ArchiverProcesses = dynamic([
-    "7z.exe","7zg.exe","7zfm.exe","7za.exe","winrar.exe","rar.exe",
-    "peazip.exe","bandizip.exe","wzzip.exe","winzip32.exe","winzip64.exe",
-    "tar.exe","zip.exe","makecab.exe","explorer.exe",
-    "powershell.exe","pwsh.exe","cmd.exe","python.exe","wscript.exe","cscript.exe"
-]);
-let DecompressionProcesses = dynamic([
-    "7z.exe","7zg.exe","7zfm.exe","7za.exe","winrar.exe","rar.exe","unrar.exe",
-    "tar.exe","peazip.exe","bandizip.exe","wzzip.exe","winzip32.exe","winzip64.exe",
-    "zip.exe","unzip.exe"
-]);
-
-//---------------------------------------------------------------------
-// BLOCK 1 — Archive anchors
-//---------------------------------------------------------------------
-let ArchiveAnchors =
+//==========================================================================
+// HUNT: Bulk document creation by anomalous process, with staging escalator
+// Window: 7 days, bucketed to match scheduled-rule burst windows
+//==========================================================================
+let Lookback            = 7d;
+let BurstWindow         = 10m;    // TUNE - burst bucket size
+let MinFileCount        = 40;     // TUNE - deliberately low (emission ceiling)
+let ArchivePriorWindow  = 30m;    // how far back an archive suppresses
+let ArchiveFollowWindow = 2h;     // how far forward an archive escalates
+let OrderTrustCeiling   = 500;    // TUNE - above this, distrust temporal order
+//
+let DocExtensions = dynamic(["docx","doc","docm","xlsx","xls","xlsm","xlsb","pptx","ppt","pptm",
+                             "pdf","csv","rtf","odt","ods","odp","msg","eml","pst","ost","one",
+                             "vsdx","vsd","accdb","mdb"]);
+let ArchiveExtensions = dynamic(["zip","7z","rar","tar","gz","tgz","bz2","xz","cab","iso","wim",
+                                 "arj","lzh","ace","001","z01","r00","r01"]);
+let SuspectProcesses = dynamic(["robocopy.exe","xcopy.exe","powershell.exe","pwsh.exe","cmd.exe",
+                                "wscript.exe","cscript.exe","mshta.exe","rundll32.exe","certutil.exe",
+                                "bitsadmin.exe","esentutl.exe","forfiles.exe","curl.exe","wget.exe",
+                                "wmic.exe","ftp.exe","python.exe"]);
+let ExcludedAccounts = dynamic(["system","local service","network service","localsystem","-"]);
+// PLACEHOLDER - replace with your service-account naming convention
+let ServiceAcctRegex = @"^(svc|sa|adm|_)[-_.]";
+// PLACEHOLDER - replace with a device-group join if you have one
+let ExcludedDeviceRegex = @"^(srv|bld|vdi|sccm|mgmt)-";
+// TUNE - extraction verbs
+let ExtractionVerbs = @"(?i)(expand-archive|7z[a]?\s+[xe]\b|\brar\s+[xe]\b|\bunzip\b|tar\s+[^|]*-?x|extractto|\bexpand\s+-)";
+//
+let ScopedCreates =
     DeviceFileEvents
-    | where TimeGenerated between (ago(Lookback) .. now())
+    | where Timestamp > ago(Lookback)
     | where ActionType == "FileCreated"
-    | extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
-    | where Ext in (ArchiveExtensions)
-    | where InitiatingProcessFileName in~ (ArchiverProcesses)
-    | where ArchiveMinSizeBytes == 0 or tolong(FileSize) >= ArchiveMinSizeBytes
-    | where not(InitiatingProcessFileName in~ ("explorer.exe","onedrive.exe")
-            and FolderPath has @"\appdata\local\temp\"
-            and FolderPath matches regex @"\.zip\.[0-9a-f]{3}\\")
-    | extend AccountSid = tostring(InitiatingProcessAccountSid)
-    | where isnotempty(DeviceId) and isnotempty(AccountSid)
-    | extend ArchiveFolderNorm = tolower(iff(
-          tolower(FolderPath) endswith tolower(FileName),
-          substring(FolderPath, 0, strlen(FolderPath) - strlen(FileName) - 1),
-          FolderPath))
-    | extend ArchiveFolderNorm = trim_end(@"\\+", ArchiveFolderNorm)
-    | extend ArchiveUnusual = iff(FolderPath matches regex UserDocRegex, 0, 1)
-    | project ArchiveTime      = TimeGenerated,
-              DeviceId, DeviceName, AccountSid,
-              AccountUpn       = InitiatingProcessAccountUpn,
-              ArchiveName      = FileName,
-              ArchiveFolderNorm, ArchiveUnusual,
-              ArchiveSizeBytes = tolong(FileSize),
-              ArchiveProcess   = InitiatingProcessFileName,
-              ArchiveParent    = InitiatingProcessParentFileName,
-              ArchiveCmdLine   = InitiatingProcessCommandLine;
-
-//---------------------------------------------------------------------
-// BLOCK 2 — Bucket keys. Widened to 3 bins to cover the tolerance
-// window, since staging can now fall in the bin AFTER the archive.
-//---------------------------------------------------------------------
-let ArchiveKeyed =
-    ArchiveAnchors
-    | mv-expand JoinBucket = pack_array(
-          bin(ArchiveTime, StagingWindow) + StagingWindow,
-          bin(ArchiveTime, StagingWindow),
-          bin(ArchiveTime, StagingWindow) - StagingWindow
-      ) to typeof(datetime);
-
-//---------------------------------------------------------------------
-// BLOCK 3 — Staging candidates
-//---------------------------------------------------------------------
-let StagingEvents =
-    DeviceFileEvents
-    | where TimeGenerated between (ago(Lookback) .. now())
-    | where ActionType == "FileCreated"
-    | extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
-    | where Ext in (DocExtensions)
+    | where isnotempty(InitiatingProcessFileName)
+    | extend FileExt = tolower(extract(@"\.([A-Za-z0-9]+)$", 1, FileName))
+    | where FileExt in (DocExtensions)
     | extend InitProc = tolower(InitiatingProcessFileName)
-    | where InitProc !in (DecompressionProcesses)
-    | where FolderPath startswith "C:\\"
-    | where not(FolderPath startswith "C:\\$Recycle.Bin")
-    // --- Application noise exclusions ---
-    | where not(FolderPath has @"\appdata\local\microsoft\windows\inetcache"
-            and InitiatingProcessFileName in~ ("outlook.exe","winword.exe","msedge.exe"))
-    | where not(FolderPath has @"\appdata\local\temp\scrub"
-            and InitiatingProcessFileName =~ "outlook.exe")
-    | where not(FolderPath has @"\appdata\local\microsoft\capture\logs"
-            and InitiatingProcessFileName =~ "capture.exe")
-    | where not(FolderPath startswith "C:\\programdata\\APPNAME3\\APP NAME FOLDER.NAME"
-            and InitiatingProcessFileName =~ "APP.NAME3.SERVICE.app.exe")
-    | where not(FolderPath matches regex @"(?i)C:\\Users\\[^\\]+\\FOLDER NAME1(\\|$)"
-            and InitiatingProcessFileName =~ "APPNAME2.exe")
-    | where not((FolderPath matches regex @"(?i)C:\\Users\\[^\\]+\\APPNAME1(\\|$)"
-                 or FolderPath startswith "C:\\Temp\\")
-            and InitiatingProcessFileName =~ "APPNAME1.exe")
-    | where not(FolderPath startswith "C:\\programdata\\templateupdates"
-            and InitiatingProcessFileName =~ "powershell.exe")
-    | where not(InitiatingProcessFileName in~ ("explorer.exe","onedrive.exe")
-            and FolderPath has @"\appdata\local\temp\"
-            and FolderPath matches regex @"\.zip\.[0-9a-f]{3}\\")
-    | extend AccountSid = tostring(InitiatingProcessAccountSid)
-    | where isnotempty(DeviceId) and isnotempty(AccountSid)
-    | extend StageFolderNorm = tolower(iff(
-          tolower(FolderPath) endswith tolower(FileName),
-          substring(FolderPath, 0, strlen(FolderPath) - strlen(FileName) - 1),
-          FolderPath))
-    | extend StageFolderNorm = trim_end(@"\\+", StageFolderNorm)
-    | extend StageUnusual = iff(FolderPath matches regex UserDocRegex, 0, 1)
-    | project StageTime    = TimeGenerated,
-              DeviceId, AccountSid,
-              StagePath    = FolderPath,
-              StageFolderNorm, StageUnusual,
-              StageProcess = InitiatingProcessFileName,
-              StageExt     = Ext,
-              JoinBucket   = bin(TimeGenerated, StagingWindow);
-
-//---------------------------------------------------------------------
-// BLOCK 4 — Correlate with ordering TOLERANCE
-//---------------------------------------------------------------------
-let Correlated =
-    ArchiveKeyed
-    | join kind=inner hint.shufflekey=DeviceId (StagingEvents)
-        on DeviceId, AccountSid, JoinBucket
-    | where StageTime <  ArchiveTime + OrderTolerance
-    | where StageTime >= ArchiveTime - StagingWindow
-    | extend ArchiveUnderStaging = iff(ArchiveFolderNorm startswith StageFolderNorm, 1, 0),
-             StagingUnderArchive = iff(StageFolderNorm startswith ArchiveFolderNorm, 1, 0)
-    | summarize StagedFileCount       = count_distinct(StagePath),
-                StagedUnusualCount    = count_distinctif(StagePath, StageUnusual == 1),
-                StagedAfterArchive    = count_distinctif(StagePath, StageTime > ArchiveTime),
-                StagingFolderCount    = count_distinct(StageFolderNorm),
-                StagingFolders        = make_set(StageFolderNorm, 5),
-                StagingUnusualFolders = make_setif(StageFolderNorm, StageUnusual == 1, 5),
-                StagingProcesses      = make_set(StageProcess, 5),
-                StagingExtensions     = make_set(StageExt, 6),
-                FirstStagedFile       = min(StageTime),
-                LastStagedFile        = max(StageTime),
-                ArchiveUnderStaging   = max(ArchiveUnderStaging),
-                StagingUnderArchive   = max(StagingUnderArchive)
-        by ArchiveTime, DeviceId, DeviceName, AccountSid, AccountUpn,
-           ArchiveName, ArchiveFolderNorm, ArchiveUnusual, ArchiveSizeBytes,
-           ArchiveProcess, ArchiveParent, ArchiveCmdLine;
-
-//---------------------------------------------------------------------
-// BLOCK 5 — Two branches, plus structural extraction filter
-//---------------------------------------------------------------------
-let Hits =
-    Correlated
-    // Structural: staged files UNDER the archive path = extraction.
-    // Doing more work now that ordering is loose.
-    | where StagingUnderArchive == 0
-    | where StagedUnusualCount >= StagingFileThreshold
-         or (ArchiveUnusual == 1 and StagedFileCount >= StagingFileThreshold)
-    | extend MatchReason = case(
-          StagedUnusualCount >= StagingFileThreshold and ArchiveUnusual == 1, "Both",
-          StagedUnusualCount >= StagingFileThreshold,                         "StagingUnusual",
-                                                                              "ArchiveUnusual");
-
-//---------------------------------------------------------------------
-// BLOCK 6 — One row per device + account + window
-//---------------------------------------------------------------------
-Hits
-| summarize MatchReason           = tostring(make_set(MatchReason)),
-            StagedFileCount       = max(StagedFileCount),
-            StagedUnusualCount    = max(StagedUnusualCount),
-            StagedAfterArchive    = max(StagedAfterArchive),
-            StagingFolderCount    = max(StagingFolderCount),
-            StagingFolders        = tostring(take_any(StagingFolders)),
-            StagingUnusualFolders = tostring(take_any(StagingUnusualFolders)),
-            StagingProcesses      = tostring(take_any(StagingProcesses)),
-            StagingExtensions     = tostring(take_any(StagingExtensions)),
-            ArchiveCount          = dcount(ArchiveName),
-            ArchiveNames          = tostring(make_set(ArchiveName, 5)),
-            ArchiveFolders        = tostring(make_set(ArchiveFolderNorm, 3)),
-            ArchiveProcesses      = tostring(make_set(ArchiveProcess, 3)),
-            ArchiveParents        = tostring(make_set(ArchiveParent, 3)),
-            ArchiveCmdLines       = tostring(make_set(ArchiveCmdLine, 3)),
-            LargestArchiveMB      = round(max(ArchiveSizeBytes) / 1048576.0, 1),
-            TotalArchiveMB        = round(sum(ArchiveSizeBytes) / 1048576.0, 1),
-            AnyArchiveUnusual     = max(ArchiveUnusual),
-            ArchiveUnderStaging   = max(ArchiveUnderStaging),
-            FirstArchive          = min(ArchiveTime),
-            LastArchive           = max(ArchiveTime),
-            FirstStagedFile       = min(FirstStagedFile),
-            LastStagedFile        = max(LastStagedFile)
-    by DeviceId, DeviceName, AccountSid, AccountUpn,
-       RunWindow = bin(ArchiveTime, 30m)
-| extend FilesPerFolder      = round(StagedFileCount * 1.0 / StagingFolderCount, 1),
-         StagingDurationMin  = round(datetime_diff('second', LastStagedFile, FirstStagedFile) / 60.0, 1),
-         GapToArchiveSeconds = datetime_diff('second', FirstArchive, LastStagedFile)
-| project RunWindow, DeviceName, AccountUpn, MatchReason,
-          StagedFileCount, StagedUnusualCount, StagedAfterArchive,
-          StagingFolderCount, FilesPerFolder,
-          StagingProcesses, StagingExtensions, StagingFolders, StagingUnusualFolders,
-          StagingDurationMin, GapToArchiveSeconds,
-          ArchiveCount, LargestArchiveMB, TotalArchiveMB, AnyArchiveUnusual,
-          ArchiveProcesses, ArchiveParents, ArchiveNames, ArchiveFolders,
-          ArchiveCmdLines, ArchiveUnderStaging,
-          FirstStagedFile, LastStagedFile, FirstArchive
-| order by RunWindow desc
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-let StagingWindow  = 30m;
-let OrderTolerance = 60m;
-let TestDevice = "MYDEVICE";
-let A = DeviceFileEvents
-    | where TimeGenerated > ago(6h)
-    | where DeviceName =~ TestDevice
+    | where InitProc in (SuspectProcesses)
+    | extend Acct = tolower(InitiatingProcessAccountName)
+    | where Acct !in (ExcludedAccounts)
+    | where Acct !endswith "$"
+    | where not(Acct matches regex ServiceAcctRegex)
+    | where not(tolower(DeviceName) matches regex ExcludedDeviceRegex)
+    | extend IsExtractionCmd = tostring(InitiatingProcessCommandLine) matches regex ExtractionVerbs;
+//
+let Bursts =
+    ScopedCreates
+    | summarize
+        FileCount          = count(),
+        DistinctFolders    = dcount(FolderPath),
+        DistinctExts       = dcount(FileExt),
+        ExtractionCmdCount = countif(IsExtractionCmd),
+        NetworkWrites      = countif(FolderPath startswith "\\\\"),
+        TempWrites         = countif(FolderPath has @"\AppData\Local\Temp" or FolderPath has @"\Windows\Temp"),
+        AppDataWrites      = countif(FolderPath has @"\AppData\"),
+        PublicWrites       = countif(FolderPath has @"\Users\Public\" or FolderPath has @"\ProgramData\"),
+        FirstCreate        = min(Timestamp),
+        LastCreate         = max(Timestamp),
+        SampleFolders      = make_set(FolderPath, 8),
+        SampleFiles        = make_set(FileName, 8),
+        CmdSample          = make_set(substring(tostring(InitiatingProcessCommandLine), 0, 250), 3),
+        ProcPaths          = make_set(InitiatingProcessFolderPath, 3)
+      by DeviceId, DeviceName, Acct, InitProc, BurstStart = bin(Timestamp, BurstWindow)
+    | where FileCount >= MinFileCount
+    | extend BurstSpanSec = datetime_diff('second', LastCreate, FirstCreate)
+    | extend FilesPerMin  = iff(BurstSpanSec <= 0, todouble(FileCount),
+                                round(FileCount / (BurstSpanSec / 60.0), 1))
+    | extend BurstQ1Time  = FirstCreate + (LastCreate - FirstCreate) * 0.25
+    | extend BurstKey     = strcat(DeviceId, "|", Acct, "|", InitProc, "|", format_datetime(BurstStart, "yyyyMMddHHmm"));
+//
+let ArchiveEvents =
+    DeviceFileEvents
+    | where Timestamp > ago(Lookback)
     | where ActionType == "FileCreated"
-    | extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
-    | where Ext in ("zip","7z","rar","zipx")
-    | extend AccountSid = tostring(InitiatingProcessAccountSid)
-    | project ArchiveTime = TimeGenerated, DeviceId, AccountSid, ArchiveName = FileName,
-              ArchiveFolder = FolderPath, ArchiveProc = InitiatingProcessFileName,
-              ArchiveMB = round(tolong(FileSize)/1048576.0, 1);
-let S = DeviceFileEvents
-    | where TimeGenerated > ago(6h)
-    | where DeviceName =~ TestDevice
-    | where ActionType == "FileCreated"
-    | extend Ext = tolower(extract(@"\.([A-Za-z0-9]{1,8})$", 1, FileName))
-    | where Ext in ("doc","docx","pdf","txt","xlsx")
-    | extend AccountSid = tostring(InitiatingProcessAccountSid)
-    | project StageTime = TimeGenerated, DeviceId, AccountSid,
-              StagePath = FolderPath, StageProc = InitiatingProcessFileName;
-A | join kind=inner (S) on DeviceId, AccountSid
-  | where StageTime < ArchiveTime + OrderTolerance
-  | where StageTime >= ArchiveTime - StagingWindow
-  | summarize StagedFiles = count_distinct(StagePath),
-              MinGapSec = min(datetime_diff('second', ArchiveTime, StageTime)),
-              MaxGapSec = max(datetime_diff('second', ArchiveTime, StageTime))
-      by ArchiveName, ArchiveFolder, ArchiveMB, ArchiveProc, ArchiveTime
+    | extend ArchExt = tolower(extract(@"\.([A-Za-z0-9]+)$", 1, FileName))
+    | where ArchExt in (ArchiveExtensions)
+    | project ArchiveTime = Timestamp, DeviceId,
+              ArchAcct    = tolower(InitiatingProcessAccountName),
+              ArchiveFull = strcat(FolderPath, "\\", FileName),
+              ArchiveProc = tolower(InitiatingProcessFileName);
+//
+let BurstArchive =
+    Bursts
+    | project BurstKey, DeviceId, Acct, FirstCreate, LastCreate, BurstQ1Time
+    | join kind=leftouter ArchiveEvents on DeviceId, $left.Acct == $right.ArchAcct
+    | extend RelPos = case(
+          isnull(ArchiveTime), "none",
+          ArchiveTime between ((FirstCreate - ArchivePriorWindow) .. FirstCreate), "prior",
+          ArchiveTime between (BurstQ1Time .. (LastCreate + ArchiveFollowWindow)), "following",
+          "outofwindow")
+    | summarize
+        ArchivePriorCount  = countif(RelPos == "prior"),
+        ArchiveFollowCount = countif(RelPos == "following"),
+        PriorArchives      = make_set_if(ArchiveFull, RelPos == "prior", 5),
+        FollowingArchives  = make_set_if(ArchiveFull, RelPos == "following", 5),
+        FollowingArchProcs = make_set_if(ArchiveProc, RelPos == "following", 5)
+      by BurstKey;
+//
+Bursts
+| join kind=leftouter BurstArchive on BurstKey
+| extend ArchivePriorCount  = coalesce(ArchivePriorCount, 0),
+         ArchiveFollowCount = coalesce(ArchiveFollowCount, 0)
+| extend Verdict = case(
+      ExtractionCmdCount > 0,
+          "SUPPRESS - extraction command line",
+      ArchivePriorCount > 0 and FileCount <  OrderTrustCeiling,
+          "SUPPRESS - archive precedes burst",
+      ArchivePriorCount > 0 and FileCount >= OrderTrustCeiling,
+          "ALERT - archive precedes, but volume exceeds order-trust ceiling",
+          "ALERT")
+| extend Severity = case(
+      Verdict startswith "SUPPRESS",                      "n/a",
+      ArchiveFollowCount > 0 and NetworkWrites > 0,       "High",
+      ArchiveFollowCount > 0,                             "High",
+      NetworkWrites > 0,                                  "Medium-High",
+      TempWrites + AppDataWrites + PublicWrites > 0,      "Medium",
+                                                          "Medium")
+| where Verdict startswith "ALERT"
+| project BurstStart, DeviceName, Acct, InitProc, FileCount, FilesPerMin, BurstSpanSec,
+          DistinctFolders, DistinctExts, NetworkWrites, TempWrites, AppDataWrites, PublicWrites,
+          ArchiveFollowCount, FollowingArchives, FollowingArchProcs,
+          ArchivePriorCount, PriorArchives,
+          Verdict, Severity, FirstCreate, LastCreate,
+          SampleFolders, SampleFiles, CmdSample, ProcPaths, DeviceId, BurstKey
+| sort by BurstStart desc
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Raw burst count (what the rule would fire on with no grouping)
+| summarize AlertBursts = count()
+
+// After device+account grouping over 4h (closer to real incident count)
+| summarize by DeviceId, Acct, GroupWindow = bin(BurstStart, 4h)
+| summarize GroupedIncidents = count()
+
+// Noise profile - what's driving volume
+| summarize Bursts = count(), TotalFiles = sum(FileCount) by InitProc, DeviceName
+| sort by Bursts desc
