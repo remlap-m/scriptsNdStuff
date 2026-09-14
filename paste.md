@@ -1,43 +1,56 @@
-let Lookback = 1h;
-let JoinWindowMinutes = 30;
-let MinReadCount = 5;          // tune this
-let MinCreateCount = 10;       // tune this
-let ArchiveExtensions = dynamic(["zip","7z","rar","cab","iso"]);
+DeviceFileEvents
+| where TimeGenerated > ago(7d) and ActionType == "FileCreated"
+| summarize Total = count(),
+            EmptyAccount = countif(isempty(AccountName)),
+            EmptyFileName = countif(isempty(FileName)),
+            EmptyFolderPath = countif(isempty(FolderPath))
 
-// Add your own exclusions here
-let ExcludedReadProcesses = dynamic([]);
-let ExcludedCreateProcesses = dynamic([]);
 
-let Reads = DeviceEvents
-| where Timestamp > ago(Lookback)
-| where ActionType == "SensitiveFileRead"
-| where isnotempty(AccountSid)
-| where tolower(InitiatingProcessFileName) !in (ExcludedReadProcesses)
-| project ReadReportId = ReportId, ReadTime = Timestamp, DeviceId, DeviceName, AccountSid,
-    AccountName = InitiatingProcessAccountName, ReadFileName = FileName;
 
-let Creates = DeviceFileEvents
-| where Timestamp > ago(Lookback)
-| where ActionType == "FileCreated"
-| where tolower(InitiatingProcessFileName) !in (ExcludedCreateProcesses)
-| extend FileExt = tolower(tostring(split(FileName, ".")[-1]))
-| extend IsArchive = FileExt in (ArchiveExtensions)
-| project CreateReportId = ReportId, CreateTime = Timestamp, DeviceId,
-    AccountSid = InitiatingProcessAccountSid, CreateFileName = FileName, IsArchive;
 
+            let Lookback = 7d;
+let ReadThreshold = 50;      // tune: reads per 30-min window to be "large"
+let CreateThreshold = 20;    // tune: creates per 30-min window to be "large"
+let WindowMinutes = 30;
+let ArchiveExtensions = dynamic(["zip","7z","rar","tar","gz","bz2","cab","iso"]);
+//
+let Reads =
+    DeviceEvents
+    | where TimeGenerated > ago(Lookback)
+    | where ActionType == "SensitiveFileRead"
+    | extend Bin = bin(TimeGenerated, 30m)
+    | summarize ReadCount = count(),
+                FirstRead = min(TimeGenerated),
+                LastRead = max(TimeGenerated),
+                SampleReadFiles = make_set(FileName, 10)
+          by DeviceId, DeviceName, AccountName, AccountDomain, Bin
+    | where ReadCount >= ReadThreshold
+    | extend JoinBin = pack_array(Bin - 30m, Bin, Bin + 30m)
+    | mv-expand JoinBin to typeof(datetime);
+//
+let Creates =
+    DeviceFileEvents
+    | where TimeGenerated > ago(Lookback)
+    | where ActionType == "FileCreated"
+    | extend Bin = bin(TimeGenerated, 30m)
+    | extend FileExt = tolower(extract(@"\.([0-9a-z]+)$", 1, FileName))
+    | summarize CreateCount = count(),
+                FirstCreate = min(TimeGenerated),
+                LastCreate = max(TimeGenerated),
+                SampleCreateFiles = make_set(FileName, 10),
+                ArchiveCount = countif(FileExt in (ArchiveExtensions)),
+                ArchiveFiles = make_set_if(FileName, FileExt in (ArchiveExtensions))
+          by DeviceId, AccountName, Bin
+    | where CreateCount >= CreateThreshold;
+//
 Reads
-| join kind=inner (Creates) on DeviceId, AccountSid
-| where CreateTime >= ReadTime
-| where datetime_diff('minute', CreateTime, ReadTime) between (0 .. JoinWindowMinutes)
-| summarize
-    ReadCount = dcount(ReadReportId),
-    CreateCount = dcount(CreateReportId),
-    ReadFiles = make_set(ReadFileName, 100),
-    CreateFiles = make_set(CreateFileName, 100),
-    ArchivePresent = countif(IsArchive) > 0,
-    ArchiveNames = make_set_if(CreateFileName, IsArchive, 10),
-    FirstRead = min(ReadTime),
-    LastCreate = max(CreateTime)
-  by DeviceId, DeviceName, AccountSid, AccountName
-| where ReadCount >= MinReadCount and CreateCount >= MinCreateCount
-| sort by ReadCount desc
+| join kind=inner (Creates) on DeviceId, AccountName, $left.JoinBin == $right.Bin
+| extend GapMinutes = datetime_diff('minute', FirstCreate, LastRead)
+| where GapMinutes between (-5 .. WindowMinutes)   // small negative allowance for near-simultaneous activity
+| summarize arg_min(abs(GapMinutes), ReadCount, LastRead, SampleReadFiles, CreateCount, FirstCreate, LastCreate, SampleCreateFiles, ArchiveCount, ArchiveFiles, DeviceName, AccountDomain)
+      by DeviceId, AccountName, Bin
+| project TimeGenerated = Bin, DeviceId, DeviceName, AccountDomain, AccountName,
+          ReadCount, LastRead, SampleReadFiles,
+          CreateCount, FirstCreate, LastCreate, SampleCreateFiles,
+          GapMinutes = abs_GapMinutes, ArchiveCount, ArchiveFiles
+| order by TimeGenerated desc
