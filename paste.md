@@ -1,8 +1,22 @@
-let Lookback = 7d;
+// =====================================================================================
+// HUNTING / BACKTEST QUERY - mass sensitive read + archive creation
+// Set Lookback below as needed (2d used here per your last run; widen once volume
+// is confirmed manageable).
+//
+// Extensions narrowed to zip/7z/rar only - .cab and .iso dropped, since neither is
+// a realistic document-collection format (Windows servicing/MSI/imaging tooling
+// creates these, not people archiving documents) and they were inflating hit volume.
+//
+// Creates filtered with endswith() BEFORE the split()/tolower() extension extraction,
+// so the expensive per-row string work only runs against plausible archive files,
+// not the full FileCreated volume - this was the main cause of slow execution.
+// =====================================================================================
+
+let Lookback = 2d;
 let JoinWindowMinutes = 30;
 let MinReadCount = 5;
 let MinDistinctRoots = 2;
-let ArchiveExtensions = dynamic(["zip","7z","rar","cab","iso"]);
+let ArchiveExtensions = dynamic(["zip","7z","rar"]);
 
 let ExcludedReadProcesses = dynamic(["msmpeng.exe","searchindexer.exe","imanage.exe","ndoffice.exe"]);
 let ExcludedArchiveProcesses = dynamic(["veeam.exe","backup.exe","backupexec.exe","arcserve.exe",
@@ -36,6 +50,7 @@ let Reads = DeviceEvents
 let Creates = DeviceFileEvents
 | where Timestamp > ago(Lookback)
 | where ActionType == "FileCreated"
+| where FileName endswith ".zip" or FileName endswith ".7z" or FileName endswith ".rar"
 | where tolower(InitiatingProcessFileName) !in (ExcludedArchiveProcesses)
 | extend FileExt = tolower(tostring(split(FileName, ".")[-1]))
 | extend IsArchive = FileExt in (ArchiveExtensions)
@@ -73,6 +88,11 @@ let Hits = Reads
 | extend RootDiversityScore = case(DistinctRoots >= 4, 20, DistinctRoots >= 2, 10, 0)
 | extend TotalScore = ProcessLinkScore + RootDiversityScore
 | extend Confidence = case(TotalScore >= 35, "High", TotalScore >= 10, "Medium", "Low");
+
+// Summary first - comment this block out and uncomment the line below to see
+// individual hits instead.
 Hits
 | summarize TotalHits = count(), DistinctDevices = dcount(DeviceId), DistinctAccounts = dcount(AccountName),
     HighConf = countif(Confidence == "High"), MedConf = countif(Confidence == "Medium"), LowConf = countif(Confidence == "Low")
+
+// Hits | sort by TotalScore desc
