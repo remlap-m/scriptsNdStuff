@@ -1,4 +1,5 @@
-let Lookback = 7d;
+let Lookback = 90m;                 // correlation window — wider than RunFrequency, see Query Frequency section below
+let RunFrequency = 15m;             // MUST match the rule's actual "Run query every" setting
 let ReadThreshold = 100;
 let CreateThreshold = 100;
 let WindowMinutes = 30;
@@ -11,6 +12,7 @@ let ExcludedAccounts = dynamic(["SYSTEM", "NETWORK SERVICE"]);        // TODO: y
 let Reads =
     DeviceEvents
     | where TimeGenerated > ago(Lookback)
+    | where ingestion_time() > ago(RunFrequency)                     // dedup gate — see Query Frequency section
     | where ActionType == "SensitiveFileRead"
     | where InitiatingProcessAccountName !in (ExcludedAccounts)
     | where InitiatingProcessFileName !in (ExcludedProcesses)
@@ -33,6 +35,7 @@ let Reads =
 let Creates =
     DeviceFileEvents
     | where TimeGenerated > ago(Lookback)
+    | where ingestion_time() > ago(RunFrequency)                     // dedup gate — see Query Frequency section
     | where ActionType == "FileCreated"
     | where InitiatingProcessAccountName !in (ExcludedAccounts)
     | where InitiatingProcessFileName !in (ExcludedProcesses)
@@ -53,59 +56,21 @@ let Creates =
           by DeviceId, InitiatingProcessAccountName, Bin
     | where CreateCount >= CreateThreshold;
 //
-let CandidateSet = materialize(
-    Reads
-    | join kind=inner (Creates) on DeviceId, InitiatingProcessAccountName, $left.JoinBin == $right.Bin
-    | extend GapMinutes = datetime_diff('minute', FirstCreate, LastRead)
-    | extend AbsGapMinutes = abs(GapMinutes)
-    | where GapMinutes between (-5 .. WindowMinutes)
-    | summarize arg_min(AbsGapMinutes, ReadCount, LastRead, SampleReadFiles, ReadFolders, DistinctReadFolders,
-                         ReadProcesses, DistinctReadProcesses,
-                         CreateCount, FirstCreate, LastCreate, SampleCreateFiles, SampleCreateFolders, DistinctCreateFolders,
-                         CreateProcesses, DistinctCreateProcesses,
-                         ArchiveCount, ArchiveFiles, ArchiveFolders,
-                         DeviceName, InitiatingProcessAccountDomain)
-          by DeviceId, InitiatingProcessAccountName, Bin
-    | project Bin, DeviceId, DeviceName, InitiatingProcessAccountDomain, InitiatingProcessAccountName,
-              ReadCount, LastRead, SampleReadFiles, ReadFolders, DistinctReadFolders, ReadProcesses, DistinctReadProcesses,
-              CreateCount, FirstCreate, LastCreate, SampleCreateFiles, SampleCreateFolders, DistinctCreateFolders,
-              CreateProcesses, DistinctCreateProcesses,
-              GapMinutes = AbsGapMinutes, ArchiveCount, ArchiveFiles, ArchiveFolders
-);
-//
-let CandidateWindows =
-    CandidateSet
-    | project DeviceId, InitiatingProcessAccountName, Bin, WindowStart = LastRead - 35m, WindowEnd = LastCreate + 5m;
-//
-let RawReads =
-    DeviceEvents
-    | where TimeGenerated > ago(Lookback)
-    | where ActionType == "SensitiveFileRead"
-    | join kind=inner (CandidateWindows) on DeviceId, InitiatingProcessAccountName
-    | where TimeGenerated between (WindowStart .. WindowEnd)
-    | project DeviceId, InitiatingProcessAccountName, Bin, ReadFileName = FileName;
-//
-let RawCreates =
-    DeviceFileEvents
-    | where TimeGenerated > ago(Lookback)
-    | where ActionType == "FileCreated"
-    | join kind=inner (CandidateWindows) on DeviceId, InitiatingProcessAccountName
-    | where TimeGenerated between (WindowStart .. WindowEnd)
-    | project DeviceId, InitiatingProcessAccountName, Bin, CreateFileName = FileName;
-//
-let FilenameOverlap =
-    RawReads
-    | join kind=inner (RawCreates) on DeviceId, InitiatingProcessAccountName, Bin
-    | where ReadFileName == CreateFileName
-    | summarize OverlapFiles = make_set(ReadFileName, 20), OverlapCount = dcount(ReadFileName)
-          by DeviceId, InitiatingProcessAccountName, Bin;
-//
-CandidateSet
-| join kind=leftouter (FilenameOverlap) on DeviceId, InitiatingProcessAccountName, Bin
-| extend OverlapCount = coalesce(OverlapCount, 0)
+Reads
+| join kind=inner (Creates) on DeviceId, InitiatingProcessAccountName, $left.JoinBin == $right.Bin
+| extend GapMinutes = datetime_diff('minute', FirstCreate, LastRead)
+| extend AbsGapMinutes = abs(GapMinutes)
+| where GapMinutes between (-5 .. WindowMinutes)
+| summarize arg_min(AbsGapMinutes, ReadCount, LastRead, SampleReadFiles, ReadFolders, DistinctReadFolders,
+                     ReadProcesses, DistinctReadProcesses,
+                     CreateCount, FirstCreate, LastCreate, SampleCreateFiles, SampleCreateFolders, DistinctCreateFolders,
+                     CreateProcesses, DistinctCreateProcesses,
+                     ArchiveCount, ArchiveFiles, ArchiveFolders,
+                     DeviceName, InitiatingProcessAccountDomain)
+      by DeviceId, InitiatingProcessAccountName, Bin
 | project TimeGenerated = Bin, DeviceId, DeviceName, InitiatingProcessAccountDomain, InitiatingProcessAccountName,
           ReadCount, LastRead, SampleReadFiles, ReadFolders, DistinctReadFolders, ReadProcesses, DistinctReadProcesses,
           CreateCount, FirstCreate, LastCreate, SampleCreateFiles, SampleCreateFolders, DistinctCreateFolders,
           CreateProcesses, DistinctCreateProcesses,
-          GapMinutes, ArchiveCount, ArchiveFiles, ArchiveFolders, OverlapCount, OverlapFiles
-| order by OverlapCount desc, TimeGenerated desc
+          GapMinutes = AbsGapMinutes, ArchiveCount, ArchiveFiles, ArchiveFolders
+| order by TimeGenerated desc
