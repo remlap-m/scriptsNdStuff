@@ -36,11 +36,12 @@ let Creates =
 Reads
 | join kind=inner (Creates) on DeviceId, InitiatingProcessAccountName, $left.JoinBin == $right.Bin
 | extend GapMinutes = datetime_diff('minute', FirstCreate, LastRead)
+| extend AbsGapMinutes = abs(GapMinutes)
 | where GapMinutes between (-5 .. WindowMinutes)
-| summarize arg_min(abs(GapMinutes), ReadCount, LastRead, SampleReadFiles, CreateCount, FirstCreate, LastCreate, SampleCreateFiles, ArchiveCount, ArchiveFiles, DeviceName, InitiatingProcessAccountDomain)
+| summarize arg_min(AbsGapMinutes, ReadCount, LastRead, SampleReadFiles, CreateCount, FirstCreate, LastCreate, SampleCreateFiles, ArchiveCount, ArchiveFiles, DeviceName, InitiatingProcessAccountDomain)
       by DeviceId, InitiatingProcessAccountName, Bin
 | project TimeGenerated = Bin, DeviceId, DeviceName, InitiatingProcessAccountDomain, InitiatingProcessAccountName,
           ReadCount, LastRead, SampleReadFiles,
           CreateCount, FirstCreate, LastCreate, SampleCreateFiles,
-          GapMinutes = abs_GapMinutes, ArchiveCount, ArchiveFiles
+          GapMinutes = AbsGapMinutes, ArchiveCount, ArchiveFiles
 | order by TimeGenerated desc
