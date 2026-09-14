@@ -1,6 +1,5 @@
 let ArchiveTools = dynamic(["7z.exe","7za.exe","7zr.exe","7zg.exe","rar.exe","winrar.exe"]);
 DeviceProcessEvents
-| where ingestion_time() > ago(15m)
 | where FileName in~ (ArchiveTools)
     or ProcessVersionInfoOriginalFileName in~ (ArchiveTools)
 | extend CmdLine = ProcessCommandLine
@@ -11,12 +10,11 @@ DeviceProcessEvents
        , NonStandardBinary  = FileName != tostring(ProcessVersionInfoOriginalFileName)
            and isnotempty(ProcessVersionInfoOriginalFileName)
 | where HasPasswordSwitch or HasHeaderEncSwitch or Has7zHeaderEnc
-| where not (InitiatingProcessAccountName =~ "svc-backupagent"
-             and InitiatingProcessFileName =~ "7z.exe"
-             and InitiatingProcessParentFileName =~ "backupscheduler.exe")
-| extend PasswordMethod = case(
-      HasHeaderEncSwitch or Has7zHeaderEnc, "HeaderEncrypted",
-      "PasswordOnly")
+| where not (InitiatingProcessAccountName =~ "<YOUR_EXCLUDED_ACCOUNT>"
+             and InitiatingProcessFileName =~ "<YOUR_EXCLUDED_TOOL>"
+             and InitiatingProcessParentFileName =~ "<YOUR_EXCLUDED_PARENT>")
+| extend PasswordMethod  = case(HasHeaderEncSwitch or Has7zHeaderEnc, "HeaderEncrypted", "PasswordOnly")
+| extend AlertSeverity   = case(PasswordMethod == "HeaderEncrypted", "High", "Medium")     // ← here
 | project Timestamp, ReportId, DeviceId, DeviceName,
           AccountName   = InitiatingProcessAccountName,
           AccountDomain = InitiatingProcessAccountDomain,
@@ -26,4 +24,4 @@ DeviceProcessEvents
           InitiatingProcessParentFileName,
           IsInitiatingProcessRemoteSession,
           PasswordMethod, SplitVolume, NonStandardBinary,
-          ProcessVersionInfoOriginalFileName
+          ProcessVersionInfoOriginalFileName, AlertSeverity   // ← and here, in the output
