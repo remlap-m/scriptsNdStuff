@@ -66,7 +66,7 @@ let CandidateSet = materialize(
                          ArchiveCount, ArchiveFiles, ArchiveFolders,
                          DeviceName, InitiatingProcessAccountDomain)
           by DeviceId, InitiatingProcessAccountName, Bin
-    | project TimeGenerated = Bin, DeviceId, DeviceName, InitiatingProcessAccountDomain, InitiatingProcessAccountName,
+    | project Bin, DeviceId, DeviceName, InitiatingProcessAccountDomain, InitiatingProcessAccountName,
               ReadCount, LastRead, SampleReadFiles, ReadFolders, DistinctReadFolders, ReadProcesses, DistinctReadProcesses,
               CreateCount, FirstCreate, LastCreate, SampleCreateFiles, SampleCreateFolders, DistinctCreateFolders,
               CreateProcesses, DistinctCreateProcesses,
@@ -75,7 +75,7 @@ let CandidateSet = materialize(
 //
 let CandidateWindows =
     CandidateSet
-    | project DeviceId, InitiatingProcessAccountName, WindowStart = LastRead - 35m, WindowEnd = LastCreate + 5m;
+    | project DeviceId, InitiatingProcessAccountName, Bin, WindowStart = LastRead - 35m, WindowEnd = LastCreate + 5m;
 //
 let RawReads =
     DeviceEvents
@@ -83,7 +83,7 @@ let RawReads =
     | where ActionType == "SensitiveFileRead"
     | join kind=inner (CandidateWindows) on DeviceId, InitiatingProcessAccountName
     | where TimeGenerated between (WindowStart .. WindowEnd)
-    | project DeviceId, InitiatingProcessAccountName, ReadFileName = FileName;
+    | project DeviceId, InitiatingProcessAccountName, Bin, ReadFileName = FileName;
 //
 let RawCreates =
     DeviceFileEvents
@@ -91,16 +91,21 @@ let RawCreates =
     | where ActionType == "FileCreated"
     | join kind=inner (CandidateWindows) on DeviceId, InitiatingProcessAccountName
     | where TimeGenerated between (WindowStart .. WindowEnd)
-    | project DeviceId, InitiatingProcessAccountName, CreateFileName = FileName;
+    | project DeviceId, InitiatingProcessAccountName, Bin, CreateFileName = FileName;
 //
 let FilenameOverlap =
     RawReads
-    | join kind=inner (RawCreates) on DeviceId, InitiatingProcessAccountName
+    | join kind=inner (RawCreates) on DeviceId, InitiatingProcessAccountName, Bin
     | where ReadFileName == CreateFileName
     | summarize OverlapFiles = make_set(ReadFileName, 20), OverlapCount = dcount(ReadFileName)
-          by DeviceId, InitiatingProcessAccountName;
+          by DeviceId, InitiatingProcessAccountName, Bin;
 //
 CandidateSet
-| join kind=leftouter (FilenameOverlap) on DeviceId, InitiatingProcessAccountName
+| join kind=leftouter (FilenameOverlap) on DeviceId, InitiatingProcessAccountName, Bin
 | extend OverlapCount = coalesce(OverlapCount, 0)
+| project TimeGenerated = Bin, DeviceId, DeviceName, InitiatingProcessAccountDomain, InitiatingProcessAccountName,
+          ReadCount, LastRead, SampleReadFiles, ReadFolders, DistinctReadFolders, ReadProcesses, DistinctReadProcesses,
+          CreateCount, FirstCreate, LastCreate, SampleCreateFiles, SampleCreateFolders, DistinctCreateFolders,
+          CreateProcesses, DistinctCreateProcesses,
+          GapMinutes, ArchiveCount, ArchiveFiles, ArchiveFolders, OverlapCount, OverlapFiles
 | order by OverlapCount desc, TimeGenerated desc
