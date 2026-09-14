@@ -35,6 +35,7 @@ let SuspiciousRenames =
     | where Timestamp > ago(lookback)
     | where ActionType == "FileRenamed"
     | where InitiatingProcessFileName !in~ (excludedProcesses)
+    | extend AccountName = InitiatingProcessAccountName, AccountSid = InitiatingProcessAccountSid
     | extend BurstBin = bin(Timestamp, renameBurstWindow)
     | join kind=inner RenameCounts on DeviceId, BurstBin
     | where RenamesInWindow <= maxRenamesInBurst
@@ -55,7 +56,7 @@ let SuspiciousRenames =
     | extend ExtToStaging = NewExt in (stagingExtensions)
     | extend ExtToNonDoc  = isnotempty(NewExt) and NewExt !in (benignExtensions) and NewExt != OldExt
     | extend HexLikeName  = NewBase matches regex @"^[a-fA-F0-9]{12,}$"
-    | extend LowVowelName = strlen(NewBase) >= 10 and NewBase !matches regex @"(?i)[aeiou]"
+    | extend LowVowelName = strlen(NewBase) >= 10 and not(NewBase matches regex @"(?i)[aeiou]")
     | extend SuspicionScore = iff(ExtStripped,1,0) + iff(ExtToStaging,1,0) + iff(ExtToNonDoc,1,0)
                              + iff(HexLikeName,1,0) + iff(LowVowelName,1,0) + iff(DirChanged,1,0) + iff(LeftProfile,1,0)
     | where ExtStripped or ExtToStaging or ExtToNonDoc or HexLikeName or LowVowelName or DirChanged
