@@ -22,4 +22,23 @@ let Reads = DeviceEvents
     AccountName = InitiatingProcessAccountName, ReadFileName = FileName, FolderRoot;
 
 let Creates = DeviceFileEvents
-| where Timestamp >
+| where Timestamp > ago(Lookback)
+| where ActionType == "FileCreated"
+| where FileName endswith ".zip" or FileName endswith ".7z" or FileName endswith ".rar"
+| extend FileExt = tolower(tostring(split(FileName, ".")[-1]))
+| where FileExt in (ArchiveExtensions)
+| project CreateReportId = ReportId, CreateTime = Timestamp, DeviceId,
+    AccountSid = InitiatingProcessAccountSid, CreateFileName = FileName, FileExt,
+    CreateProcess = InitiatingProcessFileName;
+
+Reads
+| join kind=inner (Creates) on DeviceId, AccountSid
+| where CreateTime >= ReadTime
+| where datetime_diff('minute', CreateTime, ReadTime) between (0 .. JoinWindowMinutes)
+| summarize ReadCount = dcount(ReadReportId), DistinctRoots = dcount(FolderRoot)
+  by DeviceId, DeviceName, AccountSid, AccountName, CreateReportId, CreateFileName, CreateProcess
+| where ReadCount >= MinReadCount and DistinctRoots >= MinDistinctRoots
+| summarize QualifyingArchives = count(), DistinctDevices = dcount(DeviceId), SampleDevice = any(DeviceName)
+  by CreateProcess, CreateFileName
+| sort by QualifyingArchives desc
+| take 30
