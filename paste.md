@@ -1,20 +1,19 @@
-SensitiveReads
-| join kind=inner (SuspiciousRenames) on DeviceId, AccountName
-| extend ReadDeadline = ReadTime + renameWindowMax
-| where RenameTime >= ReadTime and RenameTime <= ReadDeadline
-| extend ReadFullPath     = iff(ReadFolderPath endswith ReadFileName, ReadFolderPath, strcat(ReadFolderPath, @"\", ReadFileName))
-| extend PreviousFullPath = iff(PreviousFolderPath endswith PreviousFileName, PreviousFolderPath, strcat(PreviousFolderPath, @"\", PreviousFileName))
-| extend SHA256Match = isnotempty(ReadSHA256) and isnotempty(SHA256) and ReadSHA256 =~ SHA256
-| extend PathMatch   = ReadFullPath =~ PreviousFullPath
-| where SHA256Match or PathMatch
-| extend TimeToRename = RenameTime - ReadTime
-| project
-    ReadTime, RenameTime, TimeToRename,
-    DeviceId, DeviceName, AccountName, AccountSid,
-    ReadFolderPath, ReadFileName, ReadSHA256,
-    PreviousFolderPath, PreviousFileName, FolderPath, FileName, SHA256,
-    OldExt, NewExt, ExtStripped, ExtToStaging, ExtToNonDoc, HexLikeName, LowVowelName,
-    DirChanged, LeftProfile, SuspicionScore, RenamesInWindow,
-    SHA256Match, PathMatch,
-    InitiatingProcessFileName, InitiatingProcessCommandLine
-| sort by ReadTime desc
+let Lookback = 30d;
+let WindowMin = 30;
+let ReadBursts = DeviceEvents
+| where Timestamp > ago(Lookback)
+| where ActionType == "SensitiveFileRead"
+| summarize ReadCount = count() by DeviceId, AccountSid, AccountName, TimeBin = bin(Timestamp, WindowMin * 1m);
+let CreateBursts = DeviceFileEvents
+| where Timestamp > ago(Lookback)
+| where ActionType == "FileCreated"
+| summarize CreateCount = count(), CreateProcesses = make_set(InitiatingProcessFileName, 10)
+    by DeviceId, AccountSid, AccountName, TimeBin = bin(Timestamp, WindowMin * 1m);
+ReadBursts
+| where ReadCount >= 5
+| join kind=inner (CreateBursts | where CreateCount >= 5) on DeviceId, AccountSid, TimeBin
+| summarize
+    JointInstances = count(),
+    DistinctDevices = dcount(DeviceId),
+    DistinctAccounts = dcount(AccountName),
+    TopCreateProcesses = make_set(CreateProcesses, 20)
