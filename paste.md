@@ -1,11 +1,4 @@
-let Lookback = 7d;
-let ReadThreshold = 100;
-let CreateThreshold = 100;
-let WindowMinutes = 30;
-let ArchiveExtensions = dynamic(["zip","7z","rar","tar","gz","bz2","cab","iso"]);
-let ExcludedProcesses = dynamic(["MsMpEng.exe", "backupagent.exe"]);  // TODO: your current exclusion list
-let ExcludedAccounts = dynamic(["SYSTEM", "NETWORK SERVICE"]);        // TODO: your current exclusion list
-//
+/
 let Reads =
     DeviceEvents
     | where TimeGenerated > ago(Lookback)
@@ -17,6 +10,8 @@ let Reads =
                 FirstRead = min(TimeGenerated),
                 LastRead = max(TimeGenerated),
                 SampleReadFiles = make_set(FileName, 10),
+                ReadFolders = make_set(FolderPath, 5),
+                DistinctReadFolders = dcount(FolderPath),
                 ReadProcesses = make_set(InitiatingProcessFileName, 5),
                 DistinctReadProcesses = dcount(InitiatingProcessFileName)
           by DeviceId, DeviceName, InitiatingProcessAccountName, InitiatingProcessAccountDomain, Bin
@@ -41,7 +36,8 @@ let Creates =
                 ArchiveCount = countif(FileExt in (ArchiveExtensions)),
                 ArchiveFiles = make_set_if(FileName, FileExt in (ArchiveExtensions)),
                 ArchiveFolders = make_set_if(FolderPath, FileExt in (ArchiveExtensions)),
-                NonArchiveFolders = make_set_if(FolderPath, FileExt !in (ArchiveExtensions))
+                NonArchiveFolders = make_set_if(FolderPath, FileExt !in (ArchiveExtensions)),
+                DistinctCreateFolders = dcount(FolderPath)
           by DeviceId, InitiatingProcessAccountName, Bin
     | where CreateCount >= CreateThreshold;
 //
@@ -50,13 +46,14 @@ Reads
 | extend GapMinutes = datetime_diff('minute', FirstCreate, LastRead)
 | extend AbsGapMinutes = abs(GapMinutes)
 | where GapMinutes between (-5 .. WindowMinutes)
-| summarize arg_min(AbsGapMinutes, ReadCount, LastRead, SampleReadFiles, ReadProcesses, DistinctReadProcesses,
+| summarize arg_min(AbsGapMinutes, ReadCount, LastRead, SampleReadFiles, ReadFolders, DistinctReadFolders,
+                     ReadProcesses, DistinctReadProcesses,
                      CreateCount, FirstCreate, LastCreate, SampleCreateFiles, CreateProcesses, DistinctCreateProcesses,
-                     ArchiveCount, ArchiveFiles, ArchiveFolders, NonArchiveFolders,
+                     ArchiveCount, ArchiveFiles, ArchiveFolders, NonArchiveFolders, DistinctCreateFolders,
                      DeviceName, InitiatingProcessAccountDomain)
       by DeviceId, InitiatingProcessAccountName, Bin
 | project TimeGenerated = Bin, DeviceId, DeviceName, InitiatingProcessAccountDomain, InitiatingProcessAccountName,
-          ReadCount, LastRead, SampleReadFiles, ReadProcesses, DistinctReadProcesses,
+          ReadCount, LastRead, SampleReadFiles, ReadFolders, DistinctReadFolders, ReadProcesses, DistinctReadProcesses,
           CreateCount, FirstCreate, LastCreate, SampleCreateFiles, CreateProcesses, DistinctCreateProcesses,
-          GapMinutes = AbsGapMinutes, ArchiveCount, ArchiveFiles, ArchiveFolders, NonArchiveFolders
+          GapMinutes = AbsGapMinutes, ArchiveCount, ArchiveFiles, ArchiveFolders, NonArchiveFolders, DistinctCreateFolders
 | order by TimeGenerated desc
