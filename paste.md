@@ -578,3 +578,1131 @@ Re-validate this rule when any of the following occur:
 |---|---|---|---|
 | 1.0 | _[date]_ | Initial deployment. Dedupe by alert grouping only, no in-query gate. | _[name]_ |
 | 1.1 | _[date]_ | Added post-aggregation liveness gate (`Liveness = 2h15m`) after v1.0 produced 8 identical alerts per burst in production. Alert grouping demoted to backstop. Added blind spots for archive-escalator narrowing and unrecoverable missed executions. Added gate-inertness validation step. | _[name]_ |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Document Staging and Archiving in Unusual Locations
+
+**Rule type:** Scheduled analytics rule (Microsoft Sentinel)
+**Severity:** Medium
+**Status:** Enabled
+**Data source:** DeviceFileEvents (Microsoft Defender XDR connector)
+**MITRE ATT&CK:** TA0009 Collection — T1074.001 (Local Data Staging), T1560.001 (Archive via Utility)
+**Owner:** [name]
+**Created:** [date]
+**Last reviewed:** [date]
+
+---
+
+## 1. What it detects
+
+A burst of document-type file creation on an endpoint, followed within a short window by
+creation of an archive file (≥10 MB) by a known archiving process, under the same account
+on the same device.
+
+Two independent branches, either of which triggers the rule:
+
+| Branch | Staging location | Archive location |
+|---|---|---|
+| A — `StagingUnusual` | Outside normal user document folders | Anywhere |
+| B — `ArchiveUnusual` | Anywhere | Outside normal user document folders |
+| Both | Outside normal | Outside normal |
+
+`MatchReason` in the alert's custom details records which branch fired. `Both` is the
+strongest signal and should be triaged first.
+
+## 2. Hypothesis
+
+Collection precedes exfiltration, and compressing collected files is a common intermediate
+step (T1074 → T1560). Individually these signals are near-useless: bulk document creation
+is constant on any endpoint, and archive creation is routine. Correlated — same device,
+same account, ordered, within a short window — they are worth investigating.
+
+Location is used as a proxy for intent. This is a weak proxy and is acknowledged as such;
+see Limitations.
+
+## 3. How it works
+
+**Anchored on archive creation, not file creation.** Archives are rare relative to document
+writes, so the expensive aggregation only runs against devices that produced one. Staging
+is never evaluated estate-wide, which means staging noise never has to be tuned away
+globally — only on the small number of devices that archived something. This inversion
+reduced unfiltered volume from ~40,000 correlated pairs per week to ~300.
+
+**Four constraints do the discriminating:**
+
+| Constraint | Purpose |
+|---|---|
+| Ordering (`StageTime < ArchiveTime`) | Excludes decompression, where files appear *after* the archive |
+| Archiver process allow-list | Excludes Outlook attachment caches, Intune `.cab` writes, Office temp files — archive-shaped files that were never compressed |
+| Size ≥10 MB | Removes trivial archives |
+| Location flags | Branch logic per section 1 |
+
+**Deduplication:** anchor events are sliced by `ingestion_time()` over a window matching
+`queryFrequency`, while `queryPeriod` is set much wider. This is the pattern documented in
+*Handle ingestion delay in scheduled analytics rules*. The wide period gives staging
+correlation room and tolerates ingestion latency; the narrow ingestion slice ensures each
+archive event is processed exactly once, in the run where it lands.
+
+## 4. Configuration
+
+| Setting | Value |
+|---|---|
+| Run query every | 30 minutes |
+| Lookup data from the last | 3 hours |
+| Alert threshold | Results > 0 |
+| Event grouping | Trigger an alert for each event |
+| Suppression | Off |
+| Alert grouping | Enabled, 5 hours, matching Host + Account |
+
+**Critical:** the in-query `AnchorSlice` variable must equal `queryFrequency`. Changing one
+without the other causes either detection gaps or duplicate alerts.
+
+### Tunable parameters (all environment-specific)
+
+| Variable | Current | Sensitive to |
+|---|---|---|
+| `StagingFileThreshold` | 100 | Estate size, user workflows, **and MDE reporting fidelity — see Limitations** |
+| `ArchiveMinSizeBytes` | 10 MB | Typical archive sizes; lowered from 250 MB once correlation carried the confidence |
+| `StagingWindow` | 30 min | Observed spread between staging and archiving |
+| `UserDocRegex` | See query | Org OneDrive folder naming |
+| Exclusion lists | See query | Application estate — requires periodic review |
+
+### Entity mappings
+
+Host (HostName, MdatpDeviceId), Account (Sid, Name, UPNSuffix), File (Name, Directory),
+FileHash (SHA256), Process (CommandLine).
+
+## 5. Triage guidance
+
+Read these custom details in order:
+
+1. **`MatchReason`** — `Both` is strongest. `ArchiveUnusual` alone is weaker.
+2. **`StagingUnderArchive`** — if `1`, staged files landed *underneath* the archive path.
+   This is the signature of an extraction, not a collection. Likely benign.
+3. **`GapToArchiveSeconds`** — very small gaps (a few seconds) suggest a machine process
+   completing a copy-and-compress, not a human deciding to archive. Larger gaps are more
+   consistent with deliberate activity.
+4. **`ArchiveUnderStaging`** — if `1`, the archive was written into the staging folder tree.
+   Circumstantial support that the archive relates to the staged files.
+5. **`StagingFolders` / `ArchiveFolders`** — do the locations make sense for this user's role?
+6. **`ArchiveProcesses` / `ArchiveCmdLines`** — CLI archiving with explicit source paths is
+   more interesting than a GUI right-click.
+7. **`StagingProcesses`** — what created the documents.
+
+**Important:** the rule does **not** prove the archive contains the staged files. That is not
+determinable from `DeviceFileEvents`. Correlation is circumstantial — same device, same
+account, correct ordering, within window. Treat the alert as "these two things happened
+together", not "this data was collected and packaged".
+
+## 6. Known false positive sources
+
+| Source | Handling |
+|---|---|
+| Archive extraction (unpacking a deliverable) | Ordering constraint; `StagingUnderArchive` context column |
+| OneDrive "download as zip" multipart extraction into `%TEMP%` | Explicit narrow exclusion (process + temp path + volume-suffix directory) |
+| Outlook attachment cache / INetCache | Excluded by path + process |
+| Application-specific bulk writes | See exclusion list in query |
+| Month-end / quarter-end bulk document operations | Expected volume increase; not excluded |
+
+## 7. Limitations and blind spots
+
+**This section is not optional reading. The rule's coverage is narrower than its name suggests.**
+
+### 7.1 Staging and archiving both in normal user document folders is NOT detected
+
+A user (or an attacker with hands-on access) who collects documents into
+`Documents\subfolder\` and archives them there is invisible to this rule.
+
+This is deliberate. Testing showed that including user document folders produced 60+ alerts
+per week with no way to discriminate — the events are byte-for-byte identical to normal work,
+and `DeviceFileEvents` contains no field that separates them. This is a data limitation, not
+a tuning gap.
+
+**Compensating controls:** removable media blocked; [proxy/DLP controls — confirm and list].
+The residual exfiltration paths for this scenario are constrained by prevention rather than
+detection.
+
+### 7.2 C: volume only
+
+Mapped network drives, network shares and non-system volumes are out of scope. Non-Windows
+endpoints onboarded to MDE are also excluded as a side effect of the path logic.
+
+### 7.3 MDE does not reliably report high-rate file creation
+
+**Discovered during testing — significant, and affects any rule counting file events.**
+
+Testing with ~3,000 file creations in a short burst resulted in only a few dozen events being
+reported by the sensor. Reproduced twice. Nothing logged in
+`Microsoft-Windows-SENSE/Operational`. Normal file activity on the same device immediately
+before and after the burst reported correctly. Smaller volumes (~200 files at normal copy
+rate) reported correctly.
+
+**Implication:** `StagedFileCount` is unreliable above some rate threshold. A genuinely large
+collection event may report fewer files than a small one and fail to cross the threshold —
+biasing the rule against detecting the largest events.
+
+**Status:** [ticket ref / raised with Microsoft on DATE]
+**Outstanding:** graded testing at 500 and 1,000 files to establish where degradation begins.
+
+### 7.4 Precision comes substantially from the exclusion list
+
+The rule's low alert volume is achieved more by exclusions than by detection logic. Coverage
+is therefore partly defined by what happened to be noisy in this estate rather than by threat
+modelling. Exclusions drift as vendor behaviour changes.
+
+### 7.5 Evasion
+
+- Staging and archiving in normal user document folders (7.1)
+- Archiving with a tool not on the archiver allow-list, or a renamed binary
+- Splitting output into volumes below the 10 MB gate (e.g. `7z -v5m`)
+- Staging fewer than the threshold, or spreading activity across a longer window
+- Staging under one account context and archiving under another (e.g. SYSTEM via scheduled task)
+
+## 8. Testing
+
+### Generate a true positive
+
+1. On a test device, create 150+ document files in a folder **outside** the excluded paths
+   (e.g. `C:\Temp\test\`) — at a normal copy rate, not a scripted burst (see 7.3).
+2. Wait ~1 minute.
+3. Compress with 7-Zip or Explorer's built-in compression to a file ≥10 MB.
+4. Wait for the next scheduled run (~35–50 minutes allowing for ingestion latency).
+
+### Negative test
+
+Extract a large archive on the same device. Confirm no alert, or that `StagingUnderArchive`
+reads `1` if one appears.
+
+### Verifying query logic outside a scheduled run
+
+**Replaying a rule run will not work.** `ingestion_time() > ago(AnchorSlice)` is evaluated
+against wall-clock time at execution, so a replay of a historical run finds nothing.
+
+To verify logic, run the query in Log Analytics with the anchor line swapped for
+`| where TimeGenerated > ago(7d)`.
+
+Note also that records appear in Defender Advanced Hunting slightly before the Sentinel
+workspace copy. A row visible in Advanced Hunting may not yet be queryable in Log Analytics.
+
+## 9. Development history
+
+Notes worth retaining for anyone modifying this rule.
+
+- **`FolderPath` contains the filename** in `DeviceFileEvents`, not just the directory. This
+  broke the original folder-concentration logic completely — `count_distinct(FolderPath)` was
+  counting files, not folders, so a "≤5 destination folders" constraint could never be
+  satisfied. **Any other rule in the estate grouping or counting by `FolderPath` should be
+  audited for this.** The query derives `StageFolderNorm` / `ArchiveFolderNorm` defensively
+  (strip filename if present) rather than trusting the column.
+
+- **Folder concentration was dropped as a filter.** It was originally a proxy for "deliberate
+  staging". The archive correlation does that job better, and the concentration test actively
+  excluded structure-preserving collection (`robocopy /e`, `xcopy /s`). Retained as the
+  `FilesPerFolder` context column.
+
+- **Restricting archive anchors to known archiver processes** was the single largest noise
+  reduction — from ~40,000 to ~300 correlated pairs per week. Most "archive creation" events
+  are not archiving at all: Outlook writing `.zip` attachments to cache, Intune writing `.cab`,
+  Office temp files. The `ArchiveProcess` column name is misleading; it means "process that
+  created a file with an archive extension".
+
+- **Severity is static, not computed in-query.** Deliberate. A hand-weighted score baked into
+  KQL is unfalsifiable and obscures the reasoning from the analyst. `MatchReason` gives the
+  discrete condition instead.
+
+- **`explorer.exe` in the archiver allow-list** accounted for ~98% of pre-exclusion volume and
+  remains the weakest entry. It is retained because it covers native Windows zip creation, the
+  most accessible archiving method on any endpoint. First lever to pull if volume climbs.
+
+## 10. Review schedule
+
+| Task | Frequency |
+|---|---|
+| Audit exclusions (invert each `not()` clause, confirm still catching only what was intended) | Monthly |
+| Review alert volume and FP rate | Monthly |
+| Re-test true positive generation | Quarterly |
+| Revisit 7.3 once Microsoft respond | On response |
+
+## 11. Related
+
+- Hunting query: same logic with location exclusions removed — covers the 7.1 gap for
+  investigation and leaver review. [link]
+- [Rule 1 — mass file creation — CHECK: may be affected by the `FolderPath` issue in section 9]
+- [Unusual locations hunting query — same check applies]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Hunting Query: Mass File Creation in Unusual Location
+
+**Status:** Hunting query — not deployed as a scheduled analytics rule
+**Data source:** DeviceFileEvents (Microsoft Defender for Endpoint via Defender XDR connector)
+**Platform:** Microsoft Sentinel — Logs / Hunting
+**Owner:** [OWNER]
+**Created:** [DATE]
+**Last reviewed:** [DATE]
+**Review cadence:** Quarterly, or after any significant endpoint tooling change
+
+---
+
+## Purpose
+
+Identifies bulk creation of document-type files in locations outside network shares
+and standard user profile folders. Intended to surface potential data staging prior
+to exfiltration — a user or process gathering documents into a location that is not
+where work normally happens.
+
+Maps to MITRE ATT&CK:
+- **T1074.001** — Data Staged: Local Data Staging
+- **T1005** — Data from Local System
+
+---
+
+## Hypothesis
+
+An actor collecting data for exfiltration will gather files into a location they
+control, rather than leaving them distributed across normal working locations.
+Where an organisation's legitimate bulk file activity occurs predominantly on
+network shares and in synced profile folders, document creation outside those
+locations at volume is anomalous and worth review.
+
+---
+
+## Detection logic
+
+Fires on a single account, on a single device, creating **[THRESHOLD]** or more
+document-type files within a **20-minute window**, where the destination is:
+
+- Not a UNC / network share path
+- Not within a standard user profile folder (Documents, Downloads, Desktop, OneDrive sync roots)
+- Not matched by the environment-specific exclusion set (see below)
+
+File types in scope: Office documents, PDFs, mail items (msg, eml, pst, ost),
+text and CSV, and archive formats.
+
+A sliding window grid (four overlapping 20-minute windows spaced 5 minutes apart)
+is used so that bursts straddling a bin boundary are not split. Coverage guarantee
+is 15 minutes — any burst shorter than that falls entirely within at least one window.
+
+---
+
+## Why this is a hunting query and not a deployed rule
+
+This was originally scoped as a scheduled analytics rule. It was **not deployed**
+after tuning demonstrated that the signal cannot support unattended alerting in
+this environment.
+
+**Root cause:** DeviceFileEvents records that files were created, but not where they
+came from or whether a human initiated the action. There is no FileRead ActionType,
+no source path, and no interactive-versus-programmatic indicator. Benign bulk file
+creation (archive extraction, application caching, attachment handling, users
+working outside standard folders) and malicious staging are the same shape in this
+table on every available dimension: volume, location, folder count, file type mix.
+
+**Tuning outcome:** After approximately 20 exclusions covering process/path
+combinations, the query still produced roughly 2 results per day at a threshold of
+200 — effectively all benign. At that precision an alert queue would be closed
+without being read, which degrades response to unrelated alerts.
+
+**Retained value:** With a human reviewing output in context, the query reliably
+surfaces the right activity. It is effective for periodic review, as investigative
+context on an account already under scrutiny, and as a contributing signal
+alongside identity or process anomalies.
+
+---
+
+## Known limitations and blind spots
+
+| Limitation | Detail |
+|---|---|
+| No source visibility | Cannot distinguish a copy from a network share, an archive extraction, or a download. All appear as file creation at the destination. |
+| Single archive invisible | One large .7z containing thousands of documents is a single file event and will never meet the threshold. |
+| Slow staging invisible | Activity spread below the threshold within any 20-minute window is not detected. |
+| Excluded paths are documented blind spots | Any path/process combination in the exclusion set is a location an actor could stage in without detection. The list is enumerable by anyone with Sentinel read access. |
+| MDE telemetry is not exhaustive | The sensor applies its own filtering and may suppress events under high write volume. Absence of events is not absence of activity. |
+| Staging is not exfiltration | Nothing has left the environment when this fires. It is a precursor signal only. |
+| [IF C:\ RESTRICTION KEPT] Scoped to system drive | The `FolderPath startswith "C:\"` filter excludes secondary and removable drives, removing USB staging coverage. |
+
+---
+
+## Exclusions
+
+The exclusion set is environment-specific and was derived empirically from 7 days
+of baseline data. It consists of two categories:
+
+**Structural exclusions** — stable, low-maintenance:
+- Office lock artefacts (`~$` prefix)
+- PowerShell transcripts
+- Machine accounts (`$` suffix)
+- Recycle Bin
+- UNC paths and standard user profile folders
+
+**Inventory exclusions** — environment-specific process/path combinations covering
+endpoint management agents, Office components, capture and diagnostic tooling, and
+application temp/cache paths.
+
+> **Maintenance note:** Inventory exclusions require review whenever endpoint
+> tooling changes (Office updates, agent version changes, new software deployments).
+> Consider migrating these to a Sentinel watchlist with per-entry owner and review
+> date rather than maintaining them inline in query text.
+
+---
+
+## How to run
+
+1. Sentinel → Logs (or Hunting → New query)
+2. Paste the query
+3. Adjust `Lookback` as required — 7 days is the default; reduce to 3 days if the
+   query times out
+4. Review results sorted by `FilesCreated` descending
+
+**Performance:** A 7-day run typically takes 30+ seconds due to the sliding window
+grid multiplying rows 4x over a high-volume table. For faster iteration, replace the
+grid with a static `bin(Timestamp, Bucket)` — boundary precision is not important
+for exploratory hunting.
+
+---
+
+## Triage guidance
+
+Review these columns in order:
+
+| Column | What it tells you |
+|---|---|
+| `InitiatingProcessFileName` | The strongest single indicator. Archive tools, browsers, and Explorer are usually benign. Scripting or admin tooling (robocopy, powershell, cmd, curl) warrants investigation. |
+| `FolderSample` | Where the files landed. Application cache and temp paths are typically benign. User-created directories at drive root or in unusual locations are worth reading. |
+| `DistinctExt` | A burst spanning many file types is more consistent with deliberate collection than a homogeneous extraction or application artefact. |
+| `Actor` | Cross-reference against leavers, PIP, or investigation lists if available. |
+| `OutsideHours` | Activity outside 08:00–18:00 is not inherently suspicious but adds weight. |
+| `Labels` | Sensitivity labels where MIP coverage exists. Labelled content materially changes the significance. |
+
+**Common benign patterns:**
+- Archive extraction to a working folder (`7zG.exe`, `explorer.exe`)
+- Application temp staging in `AppData\Local\Temp\<GUID>\`
+- Outlook attachment preview and cloud attachment handling
+- Users who habitually work in non-standard local directories rather than
+  Documents or a network share
+
+---
+
+## Recommended follow-on work
+
+This signal becomes viable for alerting when paired with a second, independent
+dimension:
+
+1. **Process anomaly** — flag processes that are unusual *for that specific user*
+   rather than globally. A process baseline is a stronger discriminator than
+   location because it is harder for benign activity to imitate.
+2. **Per-user volume baseline** — replace the static threshold with a comparison
+   against the user's own historical activity. Requires summary rule infrastructure
+   writing to a custom table.
+3. **Identity correlation** — bulk file creation coinciding with a first-seen
+   sign-in country, impossible travel, or unusual device for that account.
+4. **Egress correlation** — USB device connection, personal cloud upload, or
+   archive creation following the burst.
+
+---
+
+## Change log
+
+| Date | Change | By |
+|---|---|---|
+| [DATE] | Created as hunting query following tuning of scheduled rule variant | [OWNER] |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Analytics Rule: Mass Sensitive File Read Followed by Mass File Creation
+
+**Status:** Draft / provisional — deployed disabled or audit-only pending dry-run validation
+**Author:** [your name]
+**Date created:** 2026-09-14
+**Last updated:** 2026-09-14
+
+---
+
+## 1. Summary
+
+Detects an account reading a large, tunable number of Purview-labeled sensitive
+document/archive files, followed by that same account creating a large, tunable
+number of document/archive files on the same device, within approximately 30
+minutes. Archive file creation (zip, 7z, rar, etc.) during the window is surfaced
+as informational enrichment on the alert — it is not required for the alert to fire.
+
+**Intended use case:** identify potential collection-then-staging behaviour ahead
+of data exfiltration — e.g. a compromised account or insider reviewing/copying a
+large volume of sensitive material and then repackaging or relocating it.
+
+---
+
+## 2. Hypothesis
+
+An account exhibiting an unusually large burst of sensitive-labeled file reads,
+followed shortly after by an unusually large burst of file creation on the same
+device, is more likely to represent deliberate data collection/staging than
+routine work.
+
+---
+
+## 3. Known scope limitation — read this before relying on this rule (critical)
+
+**`SensitiveFileRead` (`DeviceEvents`) is not a general "labeled file was opened"
+signal in this environment.** Empirical testing (2026-09-14) confirmed via:
+
+```kql
+DeviceEvents
+| where ActionType == "SensitiveFileRead"
+| where TimeGenerated > ago(14d)
+| summarize Count = count() by InitiatingProcessFileName
+| order by Count desc
+```
+
+...that this ActionType is generated almost entirely by **[document management
+app — name it]** and **[PDF viewer/editor — name it]**, with a smaller number of
+other processes also present. Opening a labeled Word document directly in Word
+did **not** generate this event during testing.
+
+**Practical effect:** this rule detects mass access to sensitive-labeled files
+**specifically through the applications above**. It does **not** currently detect:
+
+- Bulk file collection via command-line tools (Robocopy, PowerShell, xcopy, etc.)
+  — **not yet empirically tested**; treat as unconfirmed, not as "safe," until
+  verified in this environment (see Section 9, Open Items).
+- Sensitive file access via any process that does not emit `SensitiveFileRead`.
+- A single large archive created from many source files (see Section 4).
+
+**This is a genuine detection gap, not a tuning issue.** If the threat scenario
+of concern involves bulk copy via scripting/CLI tools or remote-session tooling
+that doesn't touch files through the apps above, this rule will not see the read
+half of the correlation and will not fire, regardless of read volume. This has
+been flagged to [manager name] as a scoping decision requiring sign-off, not
+something resolved unilaterally in this design.
+
+---
+
+## 4. Additional known blind spots and assumptions (mandatory — Palantir ADS)
+
+- **Single-archive staging is not detected.** If an attacker reads N sensitive
+  files and creates one archive containing them, `CreateCount` for that action
+  is 1, which will never clear `CreateThreshold` regardless of how low it is
+  set. This rule detects "many loose document creates," not "one compressed
+  container." A separate rule design (small `CreateCount`, but the created
+  file is an archive, sized large relative to device baseline) would be needed
+  to cover this pattern. Not built as of this version.
+- **Requires Purview sensitivity labeling to be actively applied.** If a
+  sensitive file is not labeled, `SensitiveFileRead` will never fire on it,
+  regardless of actual content sensitivity. Coverage is bounded by labeling
+  coverage, which has not been independently audited as part of this rule's
+  development.
+- **Process-based exclusions were deliberately NOT applied to general-purpose
+  interpreters** (`powershell.exe`, `cmd.exe`, `explorer.exe`, etc.), because
+  doing so would exclude the exact tooling a remote-access actor is likely to
+  use. Expect residual noise from legitimate scripted bulk operations using
+  these processes; this is the primary remaining tuning burden (see Section 9).
+- **`InitiatingProcessAccountName` can be empty** for SYSTEM/service-context
+  file operations (~0.016% of `DeviceFileEvents` `FileCreated` volume measured
+  at build time) — these rows are silently dropped from the join. Considered
+  negligible.
+- **An attacker aware of label-based DLP would target unlabeled copies of
+  sensitive data**, or use an access path that doesn't trigger
+  `SensitiveFileRead` at all. This detection assumes the attacker either
+  doesn't know this or has no choice but to go through a label-aware
+  application. It is not resilient to a sophisticated actor who avoids this.
+- **Filename/content correlation between the read set and the create set is
+  NOT implemented in this version.** `DeviceEvents` does not expose a file
+  hash field for `SensitiveFileRead`, ruling out hash-based correlation
+  entirely. A filename-overlap enrichment (does the same filename appear in
+  both the read burst and the create burst) was prototyped but not included
+  in this release — see Section 9.
+
+---
+
+## 5. Query (production, with dedup logic)
+
+```kql
+let Lookback = 90m;                 // correlation window — wider than RunFrequency
+let RunFrequency = 15m;             // MUST match the rule's actual "Run query every" setting
+let ReadThreshold = 100;            // TUNE — see Section 7
+let CreateThreshold = 100;          // TUNE — see Section 7
+let WindowMinutes = 30;
+let DocumentExtensions = dynamic(["doc","docx","xls","xlsx","ppt","pptx","pdf","csv","txt","rtf","odt","ods","odp"]);
+let ArchiveExtensions = dynamic(["zip","7z","rar","tar","gz","bz2","cab","iso"]);
+let CountedExtensions = array_concat(DocumentExtensions, ArchiveExtensions);
+let ExcludedProcesses = dynamic([/* current exclusion list */]);
+let ExcludedAccounts = dynamic(["SYSTEM", "NETWORK SERVICE"]);
+//
+let Reads =
+    DeviceEvents
+    | where TimeGenerated > ago(Lookback)
+    | where ingestion_time() > ago(RunFrequency)
+    | where ActionType == "SensitiveFileRead"
+    | where InitiatingProcessAccountName !in (ExcludedAccounts)
+    | where InitiatingProcessFileName !in (ExcludedProcesses)
+    | extend FileExt = tolower(extract(@"\.([0-9a-z]+)$", 1, FileName))
+    | where FileExt in (CountedExtensions)
+    | extend Bin = bin(TimeGenerated, 30m)
+    | summarize ReadCount = count(),
+                FirstRead = min(TimeGenerated),
+                LastRead = max(TimeGenerated),
+                SampleReadFiles = make_set(FileName, 10),
+                ReadFolders = make_set(FolderPath, 10),
+                DistinctReadFolders = dcount(FolderPath),
+                ReadProcesses = make_set(InitiatingProcessFileName, 5),
+                DistinctReadProcesses = dcount(InitiatingProcessFileName)
+          by DeviceId, DeviceName, InitiatingProcessAccountName, InitiatingProcessAccountDomain, Bin
+    | where ReadCount >= ReadThreshold
+    | extend JoinBin = pack_array(Bin - 30m, Bin, Bin + 30m)
+    | mv-expand JoinBin to typeof(datetime);
+//
+let Creates =
+    DeviceFileEvents
+    | where TimeGenerated > ago(Lookback)
+    | where ingestion_time() > ago(RunFrequency)
+    | where ActionType == "FileCreated"
+    | where InitiatingProcessAccountName !in (ExcludedAccounts)
+    | where InitiatingProcessFileName !in (ExcludedProcesses)
+    | extend FileExt = tolower(extract(@"\.([0-9a-z]+)$", 1, FileName))
+    | where FileExt in (CountedExtensions)
+    | extend Bin = bin(TimeGenerated, 30m)
+    | summarize CreateCount = count(),
+                FirstCreate = min(TimeGenerated),
+                LastCreate = max(TimeGenerated),
+                SampleCreateFiles = make_set(FileName, 10),
+                SampleCreateFolders = make_set(FolderPath, 10),
+                DistinctCreateFolders = dcount(FolderPath),
+                CreateProcesses = make_set(InitiatingProcessFileName, 5),
+                DistinctCreateProcesses = dcount(InitiatingProcessFileName),
+                ArchiveCount = countif(FileExt in (ArchiveExtensions)),
+                ArchiveFiles = make_set_if(FileName, FileExt in (ArchiveExtensions)),
+                ArchiveFolders = make_set_if(FolderPath, FileExt in (ArchiveExtensions))
+          by DeviceId, InitiatingProcessAccountName, Bin
+    | where CreateCount >= CreateThreshold;
+//
+Reads
+| join kind=inner (Creates) on DeviceId, InitiatingProcessAccountName, $left.JoinBin == $right.Bin
+| extend GapMinutes = datetime_diff('minute', FirstCreate, LastRead)
+| extend AbsGapMinutes = abs(GapMinutes)
+| where GapMinutes between (-5 .. WindowMinutes)
+| summarize arg_min(AbsGapMinutes, ReadCount, LastRead, SampleReadFiles, ReadFolders, DistinctReadFolders,
+                     ReadProcesses, DistinctReadProcesses,
+                     CreateCount, FirstCreate, LastCreate, SampleCreateFiles, SampleCreateFolders, DistinctCreateFolders,
+                     CreateProcesses, DistinctCreateProcesses,
+                     ArchiveCount, ArchiveFiles, ArchiveFolders,
+                     DeviceName, InitiatingProcessAccountDomain)
+      by DeviceId, InitiatingProcessAccountName, Bin
+| project TimeGenerated = Bin, DeviceId, DeviceName, InitiatingProcessAccountDomain, InitiatingProcessAccountName,
+          ReadCount, LastRead, SampleReadFiles, ReadFolders, DistinctReadFolders, ReadProcesses, DistinctReadProcesses,
+          CreateCount, FirstCreate, LastCreate, SampleCreateFiles, SampleCreateFolders, DistinctCreateFolders,
+          CreateProcesses, DistinctCreateProcesses,
+          GapMinutes = AbsGapMinutes, ArchiveCount, ArchiveFiles, ArchiveFolders
+| order by TimeGenerated desc
+```
+
+**Note:** the `ingestion_time()` filters cause this query to return few/no results
+when run ad hoc outside the scheduled rule (most historical records fail the
+narrow `RunFrequency` ingestion window by design). Comment out both
+`ingestion_time()` lines for interactive testing/hunting.
+
+---
+
+## 6. Block-by-block logic
+
+- **`Reads`** — aggregates `SensitiveFileRead` into 30-minute bins per
+  device/account, scoped to document + archive extensions, exclusions applied
+  pre-aggregation. The `JoinBin` triple-expansion (bin ± 30 min) prevents a
+  burst from being lost when it straddles a bin boundary.
+- **`Creates`** — same aggregation shape against `DeviceFileEvents`
+  `FileCreated`. Archive-extension creates count toward `CreateCount` and are
+  also separately broken out via `ArchiveCount`/`ArchiveFiles`/`ArchiveFolders`
+  for enrichment.
+- **Join + `GapMinutes`** — enforces the ~30 minute proximity between the read
+  burst and the create burst using actual timestamps, not just shared bin
+  membership.
+- **Final `arg_min` summarize** — collapses the triple-bin expansion back down
+  to one row per genuine device/account/bin match.
+- **`ingestion_time()` gating** — see Section 8.
+
+---
+
+## 7. Thresholds and environment-specific values (all require tuning)
+
+| Value | Current setting | Sensitive to |
+|---|---|---|
+| `ReadThreshold` | 100 | Labeling coverage; how the two label-aware apps are normally used day-to-day |
+| `CreateThreshold` | 100 | Normal document creation volume for bulk-tool users vs. individual users |
+| `WindowMinutes` | 30 | How quickly a real staging operation is expected to move from read to create |
+| `Lookback` | 90m | Must exceed `RunFrequency`; widening increases query cost |
+| `RunFrequency` | 15m | Must match the rule's "Run query every" wizard setting exactly, or dedup logic breaks |
+| `DocumentExtensions` / `ArchiveExtensions` | see query | Reflects what this org considers a sensitive document/archive format — revisit if new formats come into use |
+| `ExcludedProcesses` / `ExcludedAccounts` | see query | Built from 7-day hunt review on 2026-09-14; will need revisiting as new legitimate bulk tools are onboarded |
+
+None of these values are validated against a full production baseline — they
+reflect a single 7-day hunt sample and provisional exclusion pass.
+
+---
+
+## 8. Query frequency, lookback, and duplicate-alert handling
+
+- **Run every:** 15 minutes
+- **Lookback:** 90 minutes
+- **Boundary tolerance:** the 90-minute lookback intentionally exceeds the
+  15-minute run frequency so a read/create pair spanning a rule execution
+  boundary is still visible on the next run.
+- **Duplicate prevention:** handled via `ingestion_time()` filtering on the raw
+  `Reads`/`Creates` pulls (narrowed to `RunFrequency`), separate from the wider
+  `TimeGenerated`-based `Lookback` used for the correlation itself. This
+  ensures a given raw event is only eligible to contribute to an alert on the
+  one run during which it was newly ingested.
+- **Known residual gap:** if a read event and its paired create event are
+  ingested more than one run cycle apart, partial duplicate incidents remain
+  possible. Mitigated via Sentinel incident grouping (see Section 10), not
+  further query logic.
+
+---
+
+## 9. Open items / not yet done
+
+- [ ] Confirm empirically whether Robocopy / PowerShell / other CLI copy
+      operations against labeled files generate `SensitiveFileRead`. **Test
+      plan:** copy labeled test files on a test device via the tool in
+      question, then query
+      `DeviceEvents | where TimeGenerated > ago(15m) | where DeviceName == "<test device>" | where ActionType == "SensitiveFileRead"`.
+      Update Section 3 with the result.
+- [ ] Escalate the Section 3 scope limitation to [manager] for explicit
+      sign-off on whether current coverage is acceptable or whether a
+      complementary detection (e.g. general high-volume `DeviceFileEvents`
+      reads from sensitive-labeled paths, independent of app) is required.
+- [ ] Add filename-overlap enrichment (`OverlapCount`/`OverlapFiles`) once the
+      rule is live — compare filenames between the read burst and create burst
+      within the already-small candidate set, using short (run-frequency-scale)
+      windows rather than a historical hunt, to avoid the memory-limit issues
+      hit during initial hunt development.
+- [ ] Design a second, separate detection for the single-large-archive staging
+      pattern (Section 4) — not covered by this rule.
+- [ ] Continue tightening `ExcludedProcesses`/`ExcludedAccounts` against live
+      alert output once the rule is in dry-run, using folder-path-based
+      exclusions in preference to process-name exclusions where possible
+      (see Section 4 — general interpreters intentionally not excluded).
+- [ ] Verify "Lookup data from the last" behaviour in the current Sentinel
+      portal version against a hardcoded `ago()` lookback in the KQL itself —
+      unconfirmed whether the wizard field applies as an additional hard
+      filter or is purely cosmetic once the query defines its own window.
+
+---
+
+## 10. Rule configuration (wizard reference)
+
+**General**
+- Tactics: Collection
+- Techniques: T1005 (Data from Local System), T1560 (Archive Collected Data)
+- Severity: **Medium** (do not promote until dry-run validated)
+- Status: disabled / audit-only until dry-run period complete
+
+**Set rule logic**
+- Run query every: 15 minutes
+- Lookup data from last: 90 minutes
+- Trigger: alert when number of results > 0
+- Event grouping: group all events into a single alert
+
+**Entity mappings**
+
+| Entity | Identifier | Column |
+|---|---|---|
+| Account | Name | `InitiatingProcessAccountName` |
+| Account | NTDomain | `InitiatingProcessAccountDomain` |
+| Host | HostName | `DeviceName` |
+
+*(File entity intentionally not mapped — file-related fields are arrays with
+no single representative value; see Custom Details instead.)*
+
+**Custom details**
+
+`DeviceId`, `ReadCount`, `CreateCount`, `GapMinutes`, `SampleReadFiles`,
+`SampleCreateFiles`, `ReadFolders`, `SampleCreateFolders`,
+`DistinctReadFolders`, `DistinctCreateFolders`, `ReadProcesses`,
+`CreateProcesses`, `ArchiveCount`, `ArchiveFiles`, `ArchiveFolders`
+
+**Incident settings**
+- Create incidents from alerts: On
+- Alert grouping: On — group if all entities match
+- Group alerts triggered within: 1 hour (mitigates the ingestion-boundary
+  residual duplicate risk noted in Section 8)
+
+**Automated response**
+- None configured. Do not attach a playbook until the dry-run period confirms
+  low false-positive rate.
+
+---
+
+## 11. Testing / validation before production enablement
+
+1. Deploy to a test workspace or run disabled/audit-only in production for a
+   minimum 3–5 day dry-run.
+2. Generate a true positive: on a test device, use the confirmed label-aware
+   application(s) from Section 3 to open 100+ labeled sensitive documents in
+   quick succession, then create 100+ new document files in the same session.
+   No stock Atomic Red Team test exists for this chain; this requires a
+   custom simulation.
+3. Confirm the simulated activity surfaces in query output with expected
+   `ReadCount`/`CreateCount`/`GapMinutes` before trusting results against real
+   traffic.
+4. Review dry-run output for false-positive sources beyond current exclusions
+   — expected candidates: legitimate scripted bulk operations run through
+   `powershell.exe`/`cmd.exe` (not excluded by design, see Section 4).
+
+---
+
+## 12. Change log
+
+| Date | Change |
+|---|---|
+| 2026-09-14 | Initial hunt query built; iterative exclusion tuning; document/archive extension scoping added; `SensitiveFileRead` scope limitation discovered and documented; rule drafted for publish (disabled/audit-only) |
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# KB: Archive Creation with Password/Header Encryption Protection
+
+**Rule type:** Microsoft Sentinel Scheduled Analytics Rule
+**Data source:** Microsoft Defender for Endpoint — `DeviceProcessEvents`
+**Status:** [Draft / Shadow / Production — update on deployment]
+**Owner:** [Name]
+**Last reviewed:** [Date]
+**Related rules:** Large Archive Creation (size-based — see KB, largely superseded by this rule for TA-focused hypotheses)
+
+---
+
+## 1. Summary
+
+This rule detects the use of 7-Zip or WinRAR to create a **password-protected** or **header-encrypted** archive on an endpoint. It fires per invocation of the archiving tool, splitting the result into two confidence tiers based on the encryption method used, and excludes one known legitimate automated process identified during tuning.
+
+**In one sentence:** an actor with access to this machine used an archiver with a password/encryption switch, which has no ordinary business justification at the volume observed and is a known technique for defeating DLP content inspection before data leaves the environment.
+
+---
+
+## 2. Why this rule exists — the hypothesis
+
+**Threat hypothesis:** a threat actor — external, having gained remote access, or an insider with hands-on access — is staging data for exfiltration. Password-protecting the archive is a deliberate step: DLP and content-inspection tooling generally can't see inside an encrypted archive, so this is a way to move data past those controls undetected.
+
+This rule was built as part of a broader effort to replace a single, overly broad "large archive creation" detection with several narrower, higher-confidence rules, each targeting a distinct piece of adversary behaviour rather than one rule trying to catch everything via file size.
+
+### Why we moved away from file size as the primary signal
+
+An earlier version of this detection logic gated on `FileSize` in `DeviceFileEvents`. Testing showed two independent problems with that approach:
+
+1. **It was too noisy.** In a business where staff routinely archive large volumes of data as part of normal work, raising the size threshold did not meaningfully separate legitimate from suspicious activity — it just moved the noise floor without improving fidelity.
+2. **It was unreliable in the other direction.** Controlled testing found that `DeviceFileEvents.FileSize` frequently does not reflect a file's true final size. A 1.2GB test archive was recorded with a `FileSize` of ~840KB, because MDE's file telemetry is sampled and the value reflects whatever the size was at the moment a particular event was captured — often very early in the write. This means a size-based rule can silently miss the exact activity it exists to catch, independent of where the threshold is set.
+
+Conclusion: for this hypothesis, **file size is not a reliable gate, in either direction.** This rule does not use it.
+
+---
+
+## 3. What the rule actually does
+
+### Data source choice: `DeviceProcessEvents`, not `DeviceFileEvents`
+
+The password/encryption switch is a **command-line argument** to the archiving tool. It exists in the process-creation event, once, reliably, at the moment the tool is launched — regardless of how the resulting file is written, sampled, or renamed afterward. This sidesteps the file-size reliability problem entirely: we are detecting the *action* (an operator chose to encrypt an archive), not trying to infer it from the *artifact*.
+
+### Logic, plain English
+
+1. Look for process creation events where the binary is a known archiver (`7z.exe`, `7za.exe`, `7zr.exe`, `7zg.exe`, `rar.exe`, `winrar.exe`) — matched on either the actual filename **or** the file's internal version metadata (`ProcessVersionInfoOriginalFileName`), so a renamed copy of the binary is still caught.
+2. Check the command line for a password switch (`-p...`) or a header-encryption switch (`-hp...` or `-mhe=on`).
+3. If neither is present, discard the event — this is the bulk of all archiving activity and is not what this rule is for.
+4. If either is present, exclude one specific known-legitimate combination identified during tuning (see Section 5).
+5. Classify what's left as `HeaderEncrypted` (stronger signal) or `PasswordOnly` (weaker but still uncommon), and assign severity accordingly.
+
+### Why two severities, one rule
+
+Header encryption (`-hp` or `7-Zip's -mhe=on`) encrypts filenames and archive metadata, not just file contents — it hides *what* was collected, not only its contents. That's a more deliberate evasion step than a plain password, and our own tenant data supports treating it very differently: fewer than 10 occurrences across 30 days, against roughly 200 for password-only. The rule uses Sentinel's dynamic alert severity (`alertDetailsOverride`) to assign `High` to `HeaderEncrypted` and `Medium` to `PasswordOnly` from a single query, rather than splitting into two rules — this keeps one query, one exclusion list, and one place to maintain both.
+
+---
+
+## 4. What this rule is *not* designed to catch
+
+Documenting known blind spots deliberately, so gaps are understood rather than assumed away.
+
+- **GUI-driven password protection that doesn't shell out with visible switches.** 7-Zip's GUI is known to invoke the console binary with the same command-line arguments, so it is expected to be caught. This has **not been independently confirmed for WinRAR's GUI** in our environment — if WinRAR's GUI encrypts without exposing an equivalent switch in a child process command line, that path is currently invisible to this rule. Flagged as an open verification item (see Section 7).
+- **Interactive password prompts with no argument.** A bare `-p` with no attached value still matches (the regex accepts zero characters after `-p`), so this specific case is covered — but any method that avoids a command-line switch entirely (e.g., a GUI dialog with no corresponding child-process argument) is not.
+- **Non-supported tools.** WinZip CLI syntax, `tar` piped through `openssl`, and PowerShell's native `Compress-Archive` (which has no built-in password support) are all outside this rule's scope. A TA using `System.IO.Compression` directly from a script to build an encrypted archive would not trigger this.
+- **Renamed binaries with stripped version metadata.** The `ProcessVersionInfoOriginalFileName` fallback catches a renamed `7z.exe` in the common case, but this is version-resource metadata, not a cryptographic signature — it can be altered by a sufficiently deliberate operator and should not be treated as a guarantee.
+- **Legitimate business use.** Legal, HR, Finance, or vendor-facing teams routinely password-protect archives for external delivery (contracts, payroll data, deliverables under NDA). This rule does not distinguish intent — it flags the *behaviour*. Distinguishing intent is the analyst's job at triage, informed by the custom details on the alert (source path, parent process, remote session flag, account).
+
+**This rule detects a technique, not a verdict.** Every alert requires human triage. It is not, on its own, evidence of malicious activity — it is evidence of a behaviour that is rare enough in our environment to be worth a look.
+
+---
+
+## 5. Tuning history and exclusions
+
+| Date | Change | Evidence |
+|---|---|---|
+| [Date] | Initial validation query run over 30 days | Baseline: `None` (no password switch) ≈ 6,000+ invocations/30d; `PasswordOnly` ≈ 200/30d; `HeaderEncrypted` <10/30d |
+| [Date] | Excluded `[Account]` + `[Tool]` + `[Parent process]` tuple | Breakdown query showed this single combination accounted for the majority of the ~200 `PasswordOnly` hits. Confirmed as [describe the legitimate process — e.g., "the nightly backup job, which password-protects its output archive before shipping it to offsite storage"]. |
+
+**Why this exclusion is scoped to a tuple (account + tool + parent process), not a path.** Excluding a folder path is comparatively easy for an attacker to abuse — staging activity in a directory you've told the detection to ignore is a well-known evasion pattern. Tying the exclusion to a specific account acting as a specific parent process is a much narrower door: an attacker would need to already be operating in that service account's context to inherit the exclusion, which represents a materially larger compromise than this rule alone is meant to catch.
+
+**Review commitment:** this exclusion should be reviewed [quarterly / on a defined cadence] to confirm the underlying automated process is still active and unchanged. Exclusions for decommissioned services are a common source of silent, permanent coverage gaps — remove this line if the process it covers is retired.
+
+---
+
+## 6. Triage guidance
+
+When this alert fires, check in this order:
+
+1. **`PasswordMethod`.** `HeaderEncrypted` warrants immediate, full attention given its rarity. `PasswordOnly` warrants a quick context check before deciding on urgency.
+2. **`InitiatingProcessParentFileName`.** Descends from `explorer.exe`? Consistent with an interactive user action. Descends from `powershell.exe`, `cmd.exe`, `wscript.exe`, a remoting host (`wsmprovhost.exe`), or an unexpected parent? Materially more suspicious.
+3. **`IsInitiatingProcessRemoteSession`.** True means this happened under an RDP session — raises priority.
+4. **`NonStandardBinary`.** True means the executable name doesn't match its internal version metadata — i.e., a renamed archiver. This alone is a strong indicator regardless of the other fields.
+5. **Source paths in `ProcessCommandLine`.** Is the account archiving its own files, or someone else's / a shared location it doesn't normally touch?
+6. **Business context.** Does the account, team, or role have a known, legitimate reason to send password-protected archives externally (legal, vendor delivery, etc.)? If yes and it's a recurring, identifiable pattern, consider it a candidate for a scoped exclusion per Section 5 — don't let it sit as recurring noise.
+
+**A true positive typically looks like:** the password/encryption switch present, *plus* one or more of: a non-interactive parent process, a remote session, a non-standard binary, or a source path inconsistent with the account's normal work. The password switch alone tells you *evasion intent*; the surrounding context tells you whether *this specific instance* is likely malicious.
+
+---
+
+## 7. Open items / follow-ups
+
+- [ ] Confirm whether WinRAR's GUI exposes the password switch in a child-process command line (test on an isolated host: create a password-protected archive via the WinRAR GUI, inspect `DeviceProcessEvents`). If it does not, document this as a permanent, accepted blind spot rather than continuing to assume coverage.
+- [ ] Confirm the exact expected value format for the Sentinel dynamic severity override (`alertDetailsOverride`) in the current portal version — string matching behaviour for this feature has changed across releases.
+- [ ] Confirm NRT eligibility of `DeviceProcessEvents` if moving this rule from scheduled (10 min) to near-real-time frequency.
+- [ ] Revisit whether `PasswordOnly` volume changes meaningfully after a full quarter (seasonal business processes — e.g., year-end reporting — may not have appeared in the initial 30-day sample).
+
+---
+
+## 8. Related rules and context
+
+This rule is one of a small family of rules replacing a single broad size-based archive detection, each targeting a distinct behaviour associated with the same overall hypothesis (data staging/exfiltration by an actor with access to an endpoint):
+
+- **Archive Creation with Password/Header Encryption Protection** — this rule
+- **Large Archive Creation (size-based)** — retained as a hunting query / workbook feed only; not used as a standalone incident-generating rule due to the reliability and noise issues described in Section 2
+- [Add as built: Non-standard archiver binary path / non-interactive parent process rule]
+- [Add as built: Credential/database material archived rule]
+- [Add as built: Rapid succession / multi-archive creation rule]
+
+Splitting the original rule into this family, rather than continuing to tune one rule with an ever-growing exception list, was a deliberate decision — each behaviour has a different false-positive population and a different tuning cycle, and combining them was making all of them harder to maintain and trust.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
