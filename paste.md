@@ -1,3 +1,34 @@
+let RmmDomains = toscalar(
+    _GetWatchlist("RMMDomains")
+    | extend d = tolower(trim(@"[\s\*\.]+", tostring(column_ifexists("Domain", SearchKey))))
+    | where d has "."
+    | summarize make_set(d, 5000));
+DeviceNetworkEvents
+| where TimeGenerated > ago(14d)
+| where isnotempty(RemoteUrl)
+| where RemoteUrl has_any (RmmDomains)
+| extend Host = tolower(coalesce(
+      tostring(parse_url(RemoteUrl).Host),
+      extract(@"^([^/:]+)", 1, RemoteUrl)))
+| summarize
+    Events          = count(),
+    Devices         = dcount(DeviceId),
+    UpnPopulatedPct = round(100.0 * countif(isnotempty(InitiatingProcessAccountUpn)) / count(), 1),
+    HasSchemePct    = round(100.0 * countif(RemoteUrl matches regex @"(?i)^[a-z][a-z0-9+.\-]*://") / count(), 1)
+    by Host, InitiatingProcessFileName
+| order by Events desc
+| take 100
+
+
+print A = todatetime("05/06/2026"), B = todatetime("30/09/2026")
+
+
+
+
+
+
+
+
 //
 let RunFrequency = 5m;
 let Lookback     = 1h;
