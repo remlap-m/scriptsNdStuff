@@ -1,26 +1,68 @@
+let RunFrequency    = 5m;               // must match the rule schedule
+let IngestionWindow = RunFrequency;     // zero overlap by design: each event evaluated once
+let Lookback        = 1h;               // must be >= your p99 ingestion delay, and <= the rule's query period
 let RmmDomains = toscalar(
     _GetWatchlist("RMMDomains")
     | extend d = tolower(trim(@"[\s\*\.]+", tostring(column_ifexists("Domain", SearchKey))))
     | where d has "."
     | summarize make_set(d, 5000));
-DeviceNetworkEvents
-| where TimeGenerated > ago(14d)
-| where isnotempty(RemoteUrl)
-| where RemoteUrl has_any (RmmDomains)
-| extend Host = tolower(coalesce(
-      tostring(parse_url(RemoteUrl).Host),
-      extract(@"^([^/:]+)", 1, RemoteUrl)))
+let Exclusions =
+    _GetWatchlist("RMMExclusions")
+    | extend ExDomain = tolower(trim(@"[\s\*\.]+", tostring(column_ifexists("Domain", SearchKey))))
+    | extend ExUser   = tolower(trim(@"\s+", tostring(column_ifexists("User", ""))))
+    | extend ExRaw    = trim(@"\s+", tostring(column_ifexists("ExpiresOn", "")))
+    | extend ExEnd    = iff(ExRaw matches regex @"^\d{4}-\d{2}-\d{2}$",
+                            todatetime(ExRaw) + 1d, datetime(null))
+    | where ExDomain has "."
+    | where isempty(ExRaw) or isnotnull(ExEnd)   // bad dates dropped = exclusion not applied
+    | project ExDomain, ExUser, ExEnd, Permanent = isempty(ExRaw), k = 1;
+let Events = materialize(
+    DeviceNetworkEvents
+    | where TimeGenerated > ago(Lookback)
+    | where ingestion_time() > ago(IngestionWindow)
+    | where isnotempty(RemoteUrl)
+    | where RemoteUrl has_any (RmmDomains)
+    | extend ObservedDomain = tolower(coalesce(
+          tostring(parse_url(RemoteUrl).Host),
+          extract(@"^([^/:]+)", 1, RemoteUrl)))
+    | extend Candidates = RmmDomains
+    | mv-apply d = Candidates to typeof(string) on (
+          where ObservedDomain == d or ObservedDomain endswith strcat(".", d)
+          | top 1 by strlen(d) asc
+          | project RmmDomain = d)
+    | project-away Candidates
+    | extend UserKey = tolower(InitiatingProcessAccountUpn)
+    | serialize EventKey = row_number());
+let ExcludedEvents =
+    Events
+    | project EventKey, ObservedDomain, UserKey, TimeGenerated, k = 1
+    | join kind=inner Exclusions on k
+    | where ObservedDomain == ExDomain or ObservedDomain endswith strcat(".", ExDomain)
+    | where isempty(ExUser) or ExUser == UserKey
+    | where Permanent or TimeGenerated < ExEnd
+    | distinct EventKey;
+Events
+| join kind=leftanti ExcludedEvents on EventKey
 | summarize
-    Events          = count(),
-    Devices         = dcount(DeviceId),
-    UpnPopulatedPct = round(100.0 * countif(isnotempty(InitiatingProcessAccountUpn)) / count(), 1),
-    HasSchemePct    = round(100.0 * countif(RemoteUrl matches regex @"(?i)^[a-z][a-z0-9+.\-]*://") / count(), 1)
-    by Host, InitiatingProcessFileName
-| order by Events desc
-| take 100
-
-
-print A = todatetime("05/06/2026"), B = todatetime("30/09/2026")
+      FirstSeen     = min(TimeGenerated),
+      LastSeen      = max(TimeGenerated),
+      EventCount    = count(),
+      ObservedHosts = make_set(ObservedDomain, 20),
+      Urls          = make_set(RemoteUrl, 10),
+      RemoteIps     = make_set(RemoteIP, 10),
+      LocalIps      = make_set(LocalIP, 5),
+      Processes     = make_set(InitiatingProcessFileName, 5),
+      Actions       = make_set(ActionType, 5)
+      by RmmDomain, DeviceId, DeviceName, InitiatingProcessAccountUpn
+| extend AccountName               = tostring(split(InitiatingProcessAccountUpn, "@")[0]),
+         UPNSuffix                 = tostring(split(InitiatingProcessAccountUpn, "@")[1]),
+         PrimaryUrl                = tostring(Urls[0]),
+         RemoteIp                  = tostring(RemoteIps[0]),
+         LocalIP                   = tostring(LocalIps[0]),
+         ObservedDomain            = tostring(ObservedHosts[0]),
+         InitiatingProcessFileName = tostring(Processes[0]),
+         TimeGenerated             = LastSeen
+| order by LastSeen desc
 
 
 
