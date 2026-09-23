@@ -1,3 +1,127 @@
+# RMM Domain Connection Detection — KB
+
+2026-09-22 · @Someone
+
+## Overview
+
+This rule alerts on network connections from managed devices to domains associated with Remote Monitoring and Management (RMM) or remote-access tooling — for example TeamViewer, AnyDesk, and Tailscale.
+
+**Why it exists:** RMM tools are dual-use. They are legitimate for IT administration but are also one of the most common mechanisms used by attackers, and by scam/fraud actors coaching victims, to establish hands-on-keyboard remote access to a compromised endpoint. Unexpected outbound connections to these domains are a strong behavioral signal, particularly from devices or accounts with no legitimate reason to use RMM software.
+
+**What's new in this version:** the rule now supports an exclusions watchlist so that specific subdomains, optionally scoped to a user and/or an expiry date, can be suppressed without editing the detection logic itself. This addresses vendors (e.g. content-delivery or marketing subdomains) that share a parent domain with a genuine remote-access product but aren't remote-access traffic themselves, and short-lived, approved use of a normally-alerted tool by helpdesk or IT staff.
+
+## Scope and data sources
+
+| Item | Detail |
+| --- | --- |
+| Table | `DeviceNetworkEvents` (Defender for Endpoint, via Defender XDR connector) |
+| Coverage | Onboarded, MDE-managed Windows/macOS/Linux devices only. Unmanaged devices and network egress not seen by the sensor (e.g. non-MDE guest devices) are not covered |
+| Domain list | `RMMDomains` watchlist — the parent domains considered RMM/remote-access tooling |
+| Exclusion list | `RMMExclusions` watchlist — subdomains, optionally scoped by user and/or expiry, suppressed from alerting |
+| Field matched | `RemoteUrl`, parsed to a bare hostname |
+| Not covered | Direct-IP connections, connections where `RemoteUrl` is empty, and RMM traffic on domains not yet added to `RMMDomains` |
+
+## How the detection works
+
+The rule runs every 5 minutes and evaluates events by `ingestion_time()`, not `TimeGenerated`, with the ingestion window matched exactly to the run frequency (no overlap). This is a deliberate design choice: the rule alerts per event rather than per incident, so an overlapping window would create duplicate alerts for the same connection. The trade-off is that an event which lands in a scheduling or ingestion-delay gap between two runs can be missed rather than duplicated — acceptable here because RMM sessions typically generate repeated connections, so a single missed slice is usually caught on the next one.
+
+**Match logic, in order:**
+
+1. Events with a non-empty `RemoteUrl` matching any domain in `RMMDomains` (substring pre-filter) are pulled from the lookback window.
+2. The hostname is extracted from `RemoteUrl` and matched exactly, or as a subdomain, against the domain list — the longest matching domain wins.
+3. **Exclusion check (new):** each matched event is checked against `RMMExclusions`. An event is suppressed if its host equals or is a subdomain of an excluded domain, AND the exclusion is either unscoped or matches the event's user (UPN), AND the exclusion has not expired as of the event's timestamp. Exclusions always win over inclusions.
+4. Surviving events are aggregated by domain, device and account into one alert, carrying first/last seen, observed hosts, URLs, IPs, processes and action types.
+
+## Exclusions — the `RMMExclusions` watchlist
+
+SearchKey: `Domain`. Columns:
+
+| Column | Required | Rules |
+| --- | --- | --- |
+| `Domain` | Yes | Lowercase hostname, no scheme/path/wildcard. Suppresses that host and every subdomain of it |
+| `User` | No | UPN as it appears in telemetry. Blank = applies to all users |
+| `ExpiresOn` | No | `yyyy-MM-dd` ONLY. Blank = permanent. The listed day is inclusive |
+| `Reason` | Convention | Not read by the rule; used for audit and the health check |
+| `Owner` | Convention | Not read by the rule; used for audit and the health check |
+
+**Example rows:**
+
+```csv
+Domain,User,ExpiresOn,Reason,Owner
+cdn.engage.teamviewer.com,,,Marketing CDN - not remote access,jsmith
+goto.com,user1@contoso.com,2026-09-30,Helpdesk trial,jsmith
+```
+
+**Behavior to know:**
+
+- A non-ISO date (e.g. `30/09/2026`) is not silently coerced. The row is dropped, so the exclusion does NOT apply and the traffic alerts. This fails toward alerting rather than toward an unintended permanent suppression.
+- User scoping only works where the sensor actually populates the account UPN on the connection. Agent-style processes running as SYSTEM or a service account may have no UPN, in which case a user-scoped exclusion for that traffic will never match — it will continue to alert.
+- Exclusions always take priority over the domain list; there is no "include overrides exclude" case.
+- Write access to this watchlist should be restricted — anyone who can edit it can blind the detection for a given domain, user or window.
+
+## Triage guidance
+
+1. **Check the entities.** The alert carries the device, account, observed hostname(s), remote IP, initiating process and a sample URL.
+2. **Is this account/device expected to use RMM tools?** Helpdesk, IT admins and MSP integrations are the common legitimate case. If yes and it recurs, consider a scoped, expiring exclusion rather than closing the alert repeatedly (see Maintenance below).
+3. **Is the process a browser or an agent binary?** A browser hitting a vendor's marketing or support page is lower concern than a background agent process (e.g. `AnyDesk.exe`, `TeamViewer_Service.exe`) establishing a session with no user context.
+4. **Cross-check for known-benign infrastructure.** CDN, analytics or marketing subdomains of an RMM vendor's parent domain are false positives by design of the parent-domain match — these are exclusion-list candidates, not incidents.
+5. **If unexpected:** treat as potential attacker-established remote access. Escalate per standard incident handling — isolate the device if warranted, and review `DeviceProcessEvents` and sign-in logs for the account around the alert window.
+6. **Remember what this rule does not see:** direct-IP connections, RMM services on domains not yet on `RMMDomains`, and self-hosted remote-access infrastructure. A clean alert history for a device is not proof of no remote-access activity.
+
+## Known limitations and blind spots
+
+- **Direct-IP connections are not seen.** The rule matches on hostname parsed from `RemoteUrl`; RMM traffic that never resolves through a matched domain string is invisible to it.
+- **Domain-list dependent.** Coverage is only as good as `RMMDomains`. Self-hosted or bespoke remote-access tooling on an unlisted domain will not trigger.
+- **No overlap window (by design).** An event that falls between two 5-minute runs — due to execution jitter or ingestion visibility lag — can be missed rather than caught on a later run. Acceptable for a Medium-severity, dual-use signal where sessions typically produce repeated connections; would need reconsideration for a higher-severity, single-shot detection requirement.
+- **User-scoped exclusions depend on the UPN field being populated.** Where it is not (commonly SYSTEM/service-context agent processes), a user-scoped exclusion silently has no effect and the traffic continues to alert. This fails safe (toward alerting) but should be understood before relying on user scoping for a specific process.
+- **Exclusions are a deliberate blind spot by definition.** Any domain, user or window covered by an active exclusion will not alert for that traffic. A compromised account covered by a user-scoped exclusion is invisible for that service until the exclusion expires. Watchlist write access should be restricted, and edits should be auditable.
+- **Silent expiry.** An expired exclusion reverts to alerting with no notification. Run the watchlist health check (Maintenance, below) on a schedule so this doesn't surface as an unexplained new alert.
+
+## Maintenance
+
+**Adding a new RMM domain to detect:** add its parent domain (e.g. `screenconnect.com`) as a row to `RMMDomains`. No rule changes needed.
+
+**Adding an exclusion:**
+
+1. Confirm the subdomain is genuinely not remote-access traffic (or the user/window is genuinely approved).
+2. Add a row to `RMMExclusions` — `Domain` at minimum; `User` and `ExpiresOn` if scoping is wanted. Use `yyyy-MM-dd` only.
+3. Fill `Reason` and `Owner` — required for audit, not read by the rule.
+4. Prefer an expiring exclusion over a permanent one for anything tied to a specific approval (helpdesk trial, temporary vendor use). Permanent exclusions should be reserved for infrastructure that will never be remote-access traffic (CDN, marketing subdomains).
+
+**Periodic review — run this query and review anything not `Active`:**
+
+```kql
+_GetWatchlist("RMMExclusions")
+| extend Domain = tolower(trim(@"[\s\*\.]+", tostring(column_ifexists("Domain", SearchKey))))
+| extend ExRaw = trim(@"\s+", tostring(column_ifexists("ExpiresOn", "")))
+| extend Status = case(
+      isempty(ExRaw), "Permanent - review periodically",
+      not(ExRaw matches regex @"^\d{4}-\d{2}-\d{2}$") or isnull(todatetime(ExRaw)), "INVALID DATE - exclusion NOT applied",
+      todatetime(ExRaw) + 1d < now(), "Expired",
+      todatetime(ExRaw) < now() + 14d, "Expiring within 14d",
+      "Active")
+| project Domain, User = column_ifexists("User", ""), ExpiresOn = ExRaw, Status,
+          Reason = column_ifexists("Reason", ""), Owner = column_ifexists("Owner", "")
+| order by Status asc
+```
+
+Recommended cadence: monthly, or before any compliance/audit review of standing exceptions. Any row showing `INVALID DATE` means the exclusion is not being applied at all — fix the date format immediately.
+
+## Change history
+
+| Date | Change |
+| --- | --- |
+| 2026-09-22 | Added `RMMExclusions` watchlist support: per-subdomain, optionally user- and date-scoped suppression, applied before alert aggregation. Ingestion window confirmed at exactly the run frequency (no overlap) to preserve alert-per-event behavior. |
+
+
+
+
+
+
+
+
+
+
 # HQ-MassDocCreationAnomalousProcess
 
 **Status:** Deployed — tuning in progress
