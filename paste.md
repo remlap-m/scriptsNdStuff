@@ -1,93 +1,13 @@
-Document Creation and Archiving in Unusual Locations
-	a. Detects a burst of document-type file creation on a device followed within 30 minutes by creation of an archive by a known archiving process, under the same account, with ordering enforced so that staging precedes archiving. The rule does not prove the archive contains the staged files. Correlation is circumstantial - same device, same account, correcting ordering, within window.
-	b. Comments:
-		a. Gaps need to be documented - 
-			i. An archive whose TimeGenerated is more than 3 hours older than its ingestion time will never be seen, because Sentinel filters it out before the query runs.
-			ii. An archive delayed by between 2.5 and 3 hours is seen, but part of its staging window is outside the data, so it may fall under the threshold.
-		b. Archive size at FileCreated is often 0 or tiny 
-			i. Archives are written progressively. The FileCreated event is typically recorded when the file is first created, before the archiver has written most of the content. 
-		c. Does this cover split or multi volume archives?
-			i. Splitting archives into volumes is a common technique for getting under upload size limits. 
-			ii. Example: 
-				1. | where Ext in (ArchiveExtensions) or FileName matches regex @"(?i)\.(7z|zip|rar)\.\d{3}$|\.z\d{2}$|\.part\d+\.rar$" 
-		d. Can you confirm if moving files is covered? 
-			i. Moving files within the same volume is logged as FileRenamed, with a new folder path, not as FileCreated.
-			ii. In DeviceFileEvents, PreviousFolderPath holds only the folder, while FolderPath includes the file name. 
-		e. Extensions – pst, wpd, tif, tiff
-		f. Maybe something to consider: are these correlated? ArchiveUnderStaging and StagingUnderArchive - examples: 
-			i. Command line: When the archiver's command line contains the staging folder path, the link between staging and archive is close to proven. Flag this as CmdLineReferencesStaging
-			ii. Use the flags you already compute: use ArchiveUnderStaging == 1 to raise severity, and StagingUnderArchive == 1 to lower it, or record it as a likely false-positive indicator in triage guidance.
-
-
-Bulk Document Creation by Anomalous Process
-	a. Detects bulk creation of document filetypes by copy, scripting, or admin utilities (robocopy, xcopy, PowerShell etc.) running under an interactive user account. Creation of an archive shortly after the burst is surfaced as a staging escalator.
-	b. Comments and considerations 
-		a. The dedupe gate LastIngest > ago(1.5h) means a burst alerts in the first one or two runs after its last file is ingested, and never again. The follow window allows archives up to 2 hours after the burst. However, an archive created 60 to 120 minutes later arrives after the burst has already alerted, and possibly after it has aged out of the gate. So the alert usually fires without archive context, and the archive is never surfaced. The effective follow window is roughly "until the next run", not 2 hours. E.g., this produces a second alert, with the archive details, for the same BurstKey. Group alerts on BurstKey in the incident settings, so the escalation appears in the same incident. 
-		let ArchiveEvents =
-		    DeviceFileEvents
-		    | where ActionType == "FileCreated"
-		    ...
-		    | extend ArchIngest = ingestion_time()
-		    | project ArchiveTime = Timestamp, ArchIngest, DeviceId, ArchAcct, ArchiveFull, ArchiveProc;
-		...
-		// in BurstArchive summarize:
-		        LastFollowArchIngest = maxif(ArchIngest, RelPos == "following"),
-		...
-		// replace the dedupe gate:
-		| where LastIngest > ago(Liveness)
-		     or (ArchiveFollowCount > 0 and LastFollowArchIngest > ago(Liveness))
-		b. FolderPath includes the file name. In DeviceFileEvents, FolderPath normally contains the full path, including the file name. Your first rule already handles this with the endswith normalisation, but this rule doesn't. The effects are:
-			i. DistinctFolders actually counts distinct files, so it roughly equals FileCount.
-			ii. SampleFolders shows file paths.
-			iii. ArchiveFull = strcat(FolderPath, "\\", FileName) produces ...\data.zip\data.zip.
-			| extend ParentFolder = tolower(iff(FolderPath endswith FileName,
-			        substring(FolderPath, 0, strlen(FolderPath) - strlen(FileName) - 1), FolderPath))
-			iv. Example: Then use dcount(ParentFolder) and make_set(ParentFolder, 8), and set ArchiveFull = FolderPath if it already contains the file name. Check a few rows in your data first to confirm.
-		c. Extraction suppression is too broad, and the tar regex has a bug
-			i. where ExtractionCmdCount == 0 drops the whole burst if even one row's command line matches. Bursts are grouped by process, so if a single PowerShell session in that hour ran Expand-Archive, every PowerShell copy by that user on that device is suppressed. An attacker who knows this can include an extraction command in the same hour to silence the rule.
-			ii. Separately, tar\s+[^|]*-?x makes the hyphen optional, so it matches "tar" followed by any "x" anywhere later in the command line. For example, tar -cf out.tar C:\Xfer would be treated as an extraction, which suppresses a tar-based staging command.
-			iii. Exclude the matching rows, not the burst, and tighten the tar pattern:
-				let ExtractionVerbs = @"(?i)(expand-archive|\b7z[a]?(\.exe)?\s+[xe]\b|\brar(\.exe)?\s+[xe]\b|\bunzip\b|\btar(\.exe)?\s+(-[a-z]*x|x[a-z]*\s)|extractto|\bexpand(\.exe)?\s+-)";
-				...
-				| where not(IsExtractionCmd)   // in ScopedCreates, then drop the ExtractionCmdCount gate
-			iv. Keep ExtractionCmdCount as a custom detail only if you want visibility of how often it happens. 
-		d. Fixed 1-hour bins split bursts
-			i. A burst of 150 files between 10:50 and 11:10 lands as 75 files in each bin, and neither bin reaches 100. The rule also separates bursts by process, so a robocopy plus PowerShell copy of 60 files each won't fire either. Two ways to address this:
-			ii. Add a second set of bins offset by 30 minutes, union them with the originals, and deduplicate on device and account. This catches any burst of 100 files or more within an hour.
-			iii. Add a device-and-account-level aggregate (all suspect processes combined) with a slightly higher threshold.
-		e. The intent excludes explorer.exe, which is reasonable because your first rule covers Explorer-based staging. Document that the two rules are meant to work together. Consider adding common bulk-transfer tools that are missing from the list: rclone.exe, azcopy.exe, winscp.exe, pscp.exe, scp.exe, rsync.exe, fastcopy.exe, teracopy.exe, bash.exe/wsl.exe, and node.exe. 
+DeviceFileEvents
+| where TimeGenerated > ago(3d)
+| where ActionType == "<your test ActionType>"
+| summarize Rows = count(), DistinctSHA1 = dcount(SHA1), DistinctFolder = dcount(FolderPath),
+            SHA1Blank = countif(isempty(SHA1)), FolderBlank = countif(isempty(FolderPath))
+    by DeviceId, FileName, bin(Timestamp, 10s)
+| where Rows > 1
 
 
 
-Bulk Sensitive File Read Followed by Bulk File Creation
-	a. Detects an account reading a large number of sensitive-labelled documents (includes local and network paths), followed by the same account creating a large number of documents (also includes archive creation) on the same device within a fixed window. Designed to catch potential collection followed by staging, ahead of exfiltration. This rule is still currently being tuned,expect false positives, currently deployed as Medium to account for this. 
-	b. Comments and considerations:
-		a. The ingestion gate is applied before aggregation 
-			i. Both Reads and Creates filter raw rows with ingestion_time() > ago(RunFrequency) before they're counted. Two things follow from that:
-				1. Thresholds only count one slice. Each run only counts rows ingested in the last 15 minutes. Defender for Endpoint sends data in batches, so a burst of 300 reads is often spread across several ingestion slices. Each run may only see part of it, and none of the parts reaches 100.
-				2. Reads and creates must arrive together. A correlated pair only matches if both sides land in the same 15-minute ingestion slice. Reads that happen 20 minutes before creates will usually have been ingested in an earlier run, so the join never sees them together. The 90-minute lookback, which is meant to allow correlation, is effectively unused. A pair can now re-alert as new data arrives for it. Set incident grouping on device and account so these updates land in one incident.
-				3. 
-				let Reads =
-				    DeviceEvents
-				    | where TimeGenerated > ago(Lookback)
-				    | where ActionType == "SensitiveFileRead"
-				    ...
-				    | extend IngestAt = ingestion_time()
-				    | summarize ..., ReadLastIngest = max(IngestAt) by ...
-				    ...
-				let Creates =
-				    DeviceFileEvents
-				    | where TimeGenerated > ago(Lookback)
-				    ...
-				    | extend IngestAt = ingestion_time()
-				    | summarize ..., CreateLastIngest = max(IngestAt) by ...
-				    ...
-				Reads
-				| join kind=inner (Creates) on ...
-				| where max_of(ReadLastIngest, CreateLastIngest) > ago(RunFrequency)   // gate after correlation
-		b. The timing test excludes simultaneous copying
-			i. GapMinutes = FirstCreate − LastRead must fall between −5 and +30. When someone copies files, each file is read and its copy is created almost at the same moment. The reads and creates therefore run in parallel, and LastRead is close to LastCreate. For a copy that takes 10 minutes, the gap is about −10, so it fails the check. The rule is most likely to catch "read everything, then write later", which is the less common pattern. Carry FirstRead through the summarize, as it's already calculated.
-			| where FirstCreate between ((FirstRead - 5m) .. (LastRead + totimespan(strcat(WindowMinutes, "m"))))
 
 
 
