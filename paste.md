@@ -1,13 +1,19 @@
-DeviceFileEvents
-| where TimeGenerated > ago(3d)
-| where ActionType == "<your test ActionType>"
-| summarize Rows = count(), DistinctSHA1 = dcount(SHA1), DistinctFolder = dcount(FolderPath),
-            SHA1Blank = countif(isempty(SHA1)), FolderBlank = countif(isempty(FolderPath))
-    by DeviceId, FileName, bin(Timestamp, 10s)
-| where Rows > 1
+DeviceInfo
+| where TimeGenerated > ago(14d)
+| summarize arg_max(TimeGenerated, OSPlatform, DeviceType, OnboardingStatus) by DeviceId
+| summarize Devices = count() by OSPlatform, DeviceType, OnboardingStatus
+| order by Devices desc
 
 
-
+// Swap the watchlist for your CMDB export or naming convention
+let KnownServers = _GetWatchlist('<ServerInventoryWatchlist>')
+    | project ServerName = tolower(tostring(<NameColumn>));
+DeviceInfo
+| where TimeGenerated > ago(14d)
+| summarize arg_max(TimeGenerated, OSPlatform, DeviceType) by DeviceId, DeviceName
+| extend ShortName = tolower(tostring(split(DeviceName, ".")[0]))
+| join kind=inner KnownServers on $left.ShortName == $right.ServerName
+| summarize Devices = count() by OSPlatform, DeviceType
 
 
 
